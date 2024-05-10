@@ -11047,3 +11047,9 @@ def test_dataframe_from_frame_with_index_or_columns_reindexes(
 def test_dict_tuple_keys_must_all_be_tuple_keys():
     with pytest.raises(ValueError):
         cudf.DataFrame({(1, 2): [1], 3: [2]})
+
+
+def test_empty_dict_data_rangeindex_columns():
+    result = cudf.DataFrame({}).columns
+    expected = pd.RangeIndex(0)
+    pd.testing.assert_index_equal(result, expected, exact=True)

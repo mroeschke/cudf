@@ -865,6 +865,9 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
             index = result[1]
             columns, columns_from_data = result[2], columns
             col_is_multiindex = isinstance(columns, pd.MultiIndex)
+            if not col_is_multiindex:
+                col_dtype = columns.dtype
+                col_is_rangeindex = isinstance(columns, pd.RangeIndex)
         else:
             raise TypeError(
                 f"data must be list or dict-like, not {type(data).__name__}"
