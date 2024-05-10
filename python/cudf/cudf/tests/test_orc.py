@@ -887,7 +887,8 @@ def test_nanoseconds_overflow():
 
 def test_empty_dataframe():
     buffer = BytesIO()
-    expected = cudf.DataFrame()
+    # ORC does not maintain RangeIndex column metadata
+    expected = cudf.DataFrame(index=cudf.Index([], dtype="object"))
     expected.to_orc(buffer)
 
     # Raise error if column name is mentioned, but it doesn't exist.

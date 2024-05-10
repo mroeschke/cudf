@@ -11010,3 +11010,40 @@ def test_dataframe_init_with_nans():
     assert gdf["a"].dtype == np.dtype("float64")
     pdf = pd.DataFrame({"a": [1, 2, 3, np.nan]})
     assert_eq(pdf, gdf)
+
+
+def test_dict_uneven_tuple_keys_fill_with_NA():
+    data = ({("a", "b"): [1, 2, 3], ("2",): [10, 11, 23]},)
+    result = cudf.DataFrame(data)
+    expected = pd.DataFrame(data)
+    assert_eq(result, expected)
+
+
+def test_dataframe_from_dict_only_scalar_values_raises():
+    with pytest.raises(ValueError):
+        cudf.DataFrame({0: 3, 1: 2})
+
+
+@pytest.mark.parametrize("klass", [cudf.DataFrame, pd.DataFrame])
+@pytest.mark.parametrize(
+    "axis_kwargs, exp_data",
+    [
+        [
+            {"index": [1, 2], "columns": [1, 2]},
+            np.array([[1.0, np.nan], [np.nan, np.nan]]),
+        ],
+        [{"index": [1, 2]}, np.array([[0.0, 1.0], [np.nan, np.nan]])],
+        [{"columns": [1, 2]}, np.array([[0.0, np.nan], [1.0, np.nan]])],
+    ],
+)
+def test_dataframe_from_frame_with_index_or_columns_reindexes(
+    klass, axis_kwargs, exp_data
+):
+    result = cudf.DataFrame(klass(np.eye(2)), **axis_kwargs)
+    expected = cudf.DataFrame(exp_data, **axis_kwargs)
+    assert_eq(result, expected)
+
+
+def test_dict_tuple_keys_must_all_be_tuple_keys():
+    with pytest.raises(ValueError):
+        cudf.DataFrame({(1, 2): [1], 3: [2]})
