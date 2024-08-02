@@ -1626,11 +1626,12 @@ def build_column(
         )
     elif dtype.type in (np.object_, np.str_):
         return cudf.core.column.StringColumn(
-            data=data,
-            mask=mask,
+            data=data,  # type: ignore[arg-type]
             size=size,
+            dtype=dtype,
+            mask=mask,
             offset=offset,
-            children=children,
+            children=children,  # type: ignore[arg-type]
             null_count=null_count,
         )
     elif isinstance(dtype, ListDtype):

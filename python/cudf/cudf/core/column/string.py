@@ -16,9 +16,9 @@ import cudf.api.types
 from cudf import _lib as libcudf
 from cudf._lib import string_casting as str_cast, strings as libstrings
 from cudf._lib.column import Column
-from cudf._lib.types import size_type_dtype
 from cudf.api.types import is_integer, is_scalar, is_string_dtype
-from cudf.core.column import column, datetime
+from cudf.core.buffer import Buffer
+from cudf.core.column import column, datetime, numerical
 from cudf.core.column.column import ColumnBase
 from cudf.core.column.methods import ColumnMethods
 from cudf.utils.docutils import copy_docstring
@@ -43,8 +43,6 @@ if TYPE_CHECKING:
         ScalarLike,
         SeriesOrIndex,
     )
-    from cudf.core.buffer import Buffer
-
 
 _str_to_numeric_typecast_functions = {
     cudf.api.types.dtype("int8"): str_cast.stoi8,
@@ -5415,13 +5413,14 @@ class StringColumn(column.ColumnBase):
 
     Parameters
     ----------
+    data: Buffer
+        A buffer of the string data
     mask : Buffer
         The validity mask
     offset : int
         Data offset
     children : Tuple[Column]
-        Two non-null columns containing the string data and offsets
-        respectively
+        One non-null integer columns of offsets.
     """
 
     _start_offset: int | None
@@ -5449,22 +5448,31 @@ class StringColumn(column.ColumnBase):
 
     def __init__(
         self,
-        data: Buffer | None = None,
+        data: Buffer,
+        size: int | None,
+        dtype: np.dtype,
         mask: Buffer | None = None,
-        size: int | None = None,  # TODO: make non-optional
         offset: int = 0,
         null_count: int | None = None,
-        children: tuple["column.ColumnBase", ...] = (),
+        children: tuple[numerical.NumericalColumn] = (),  # type: ignore[assignment]
     ):
-        dtype = cudf.api.types.dtype("object")
+        if not isinstance(data, Buffer):
+            raise ValueError("data must be a Buffer")
+        if not (isinstance(dtype, np.dtype) and dtype.kind == "O"):
+            raise ValueError("dtype must be a numpy.dtype('object')")
+        if not (
+            len(children) == 1
+            and isinstance(children[0], numerical.NumericalColumn)
+            and children[0].dtype.kind == "i"
+        ):
+            raise ValueError(
+                "children must be a signed integer column of offsets."
+            )
 
         if size is None:
-            for child in children:
-                assert child.offset == 0
-
-            if len(children) == 0:
-                size = 0
-            elif children[0].size == 0:
+            child = children[0]
+            assert child.offset == 0
+            if child.size == 0:
                 size = 0
             else:
                 # one less because the last element of offsets is the number of
@@ -5472,13 +5480,13 @@ class StringColumn(column.ColumnBase):
                 size = children[0].size - 1
             size = size - offset
 
-        if len(children) == 0 and size != 0:
-            # all nulls-column:
-            offsets = column.as_column(
-                0, length=size + 1, dtype=size_type_dtype
-            )
+        # if len(children) == 0 and size != 0:
+        #     # all nulls-column:
+        #     offsets = column.as_column(
+        #         0, length=size + 1, dtype=size_type_dtype
+        #     )
 
-            children = (offsets,)
+        #     children = (offsets,)
 
         super().__init__(
             data=data,
@@ -5490,85 +5498,23 @@ class StringColumn(column.ColumnBase):
             children=children,
         )
 
-        self._start_offset = None
-        self._end_offset = None
-
     def copy(self, deep: bool = True):
         # Since string columns are immutable, both deep
         # and shallow copies share the underlying device data and mask.
         return super().copy(deep=False)
 
-    @property
-    def start_offset(self) -> int:
-        if self._start_offset is None:
-            if (
-                len(self.base_children) == 1
-                and self.offset < self.base_children[0].size
-            ):
-                self._start_offset = int(
-                    self.base_children[0].element_indexing(self.offset)
-                )
-            else:
-                self._start_offset = 0
-
-        return self._start_offset
-
-    @property
-    def end_offset(self) -> int:
-        if self._end_offset is None:
-            if (
-                len(self.base_children) == 1
-                and (self.offset + self.size) < self.base_children[0].size
-            ):
-                self._end_offset = int(
-                    self.base_children[0].element_indexing(
-                        self.offset + self.size
-                    )
-                )
-            else:
-                self._end_offset = 0
-
-        return self._end_offset
-
     @cached_property
     def memory_usage(self) -> int:
-        n = 0
-        if self.data is not None:
-            n += self.data.size
-        if len(self.base_children) == 1:
-            child0_size = (self.size + 1) * self.base_children[
-                0
-            ].dtype.itemsize
-
-            n += child0_size
+        n = self.data.size  # type: ignore[union-attr]
+        child0_size = (self.size + 1) * self.base_children[0].dtype.itemsize
+        n += child0_size
         if self.nullable:
             n += cudf._lib.null_mask.bitmask_allocation_size_bytes(self.size)
         return n
 
     @property
     def base_size(self) -> int:
-        if len(self.base_children) == 0:
-            return 0
-        else:
-            return self.base_children[0].size - 1
-
-    # override for string column
-    @property
-    def data(self):
-        if self.base_data is None:
-            return None
-        if self._data is None:
-            if (
-                self.offset == 0
-                and len(self.base_children) > 0
-                and self.size == self.base_children[0].size - 1
-            ):
-                self._data = self.base_data
-            else:
-                self._data = self.base_data[
-                    self.start_offset : self.end_offset
-                ]
-        return self._data
+        return self.base_children[0].size - 1
 
     def all(self, skipna: bool = True) -> bool:
         if skipna and self.null_count == self.size:
