@@ -171,14 +171,9 @@ As one example, a `NumericalColumn` with 1000 `int32` elements and containing nu
 
 As another example, a `StringColumn` backing the Series `['do', 'you', 'have', 'any', 'cheese?']` is composed of:
 
-1. No data buffer
+1. A data buffer of UTF-8 characters `['d', 'o', 'y', 'o', 'u', 'h', ..., '?']`
 2. No mask buffer as there are no nulls in the Series
-3. Two children columns:
-
-   - A column of UTF-8 characters
-     `['d', 'o', 'y', 'o', 'u', 'h', ..., '?']`
-   - A column of "offsets" to the characters column (in this case,
-     `[0, 2, 5, 9, 12, 19]`)
+3. A child column of "offsets" to the characters column (in this case, `[0, 2, 5, 9, 12, 19]`):
 
 
 ### Data types
