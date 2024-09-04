@@ -18,6 +18,7 @@ set(cython_sources
     column.pyx
     column_factories.pyx
     concatenate.pyx
+    contiguous_split.pyx
     copying.pyx
     datetime.pyx
     experimental.pyx
