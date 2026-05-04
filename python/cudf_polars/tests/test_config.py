@@ -343,7 +343,6 @@ def test_validate_shuffle_method_defaults() -> None:
         "max_rows_per_partition",
         "unique_fraction",
         "target_partition_size",
-        "groupby_n_ary",
         "broadcast_join_limit",
         "sink_to_directory",
         "client_device_threshold",
@@ -411,7 +410,6 @@ def test_config_option_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__EXECUTOR__MAX_ROWS_PER_PARTITION", "42")
         m.setenv("CUDF_POLARS__EXECUTOR__UNIQUE_FRACTION", '{"a": 0.5}')
         m.setenv("CUDF_POLARS__EXECUTOR__TARGET_PARTITION_SIZE", "100")
-        m.setenv("CUDF_POLARS__EXECUTOR__GROUPBY_N_ARY", "43")
         m.setenv("CUDF_POLARS__EXECUTOR__BROADCAST_JOIN_LIMIT", "44")
         m.setenv("CUDF_POLARS__EXECUTOR__SHUFFLE_METHOD", "tasks")
         m.setenv("CUDF_POLARS__CUDA_STREAM_POLICY", "default")
@@ -424,7 +422,6 @@ def test_config_option_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert config.executor.max_rows_per_partition == 42
         assert config.executor.unique_fraction == {"a": 0.5}
         assert config.executor.target_partition_size == 100
-        assert config.executor.groupby_n_ary == 43
         assert config.executor.broadcast_join_limit == 44
         assert config.executor.shuffle_method == "tasks"
         assert config.cuda_stream_policy is None

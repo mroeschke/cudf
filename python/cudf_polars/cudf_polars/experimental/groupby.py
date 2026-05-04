@@ -488,7 +488,7 @@ def _(
         partition_info[gb_inter] = PartitionInfo(count=post_aggregation_count)
     else:
         # N-ary tree reduction
-        n_ary = config_options.executor.groupby_n_ary
+        n_ary = 32
         count = child_count
         gb_inter = gb_pwise
         while count > post_aggregation_count:
