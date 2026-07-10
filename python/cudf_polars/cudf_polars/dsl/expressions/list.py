@@ -35,6 +35,7 @@ class ListFunction(Expr):
         DropNulls = auto()
         Get = auto()
         Length = auto()
+        SetOperation = auto()
         Sort = auto()
 
         @classmethod
@@ -51,8 +52,10 @@ class ListFunction(Expr):
         Name.DropNulls,
         Name.Get,
         Name.Length,
+        Name.SetOperation,
         Name.Sort,
     }
+    _valid_set_operations: ClassVar[set[str]] = {"difference"}
     __slots__ = ("name", "options")
     _non_child = ("dtype", "name", "options")
 
@@ -70,6 +73,11 @@ class ListFunction(Expr):
         self.is_pointwise = True
         if self.name not in self._valid_ops:
             raise NotImplementedError(f"List function {self.name!r}")
+        if (
+            self.name is self.Name.SetOperation
+            and self.options[0] not in self._valid_set_operations
+        ):
+            raise NotImplementedError(f"List set operation {self.options[0]!r}")
 
     def do_evaluate(
         self, df: DataFrame, *, context: ExecutionContext = ExecutionContext.FRAME
@@ -153,6 +161,18 @@ class ListFunction(Expr):
                     list_column.obj,
                     order[0],
                     null_order[0],
+                    stream=df.stream,
+                ),
+                dtype=self.dtype,
+            )
+        if self.name is ListFunction.Name.SetOperation:
+            lhs, rhs = columns
+            return Column(
+                plc.lists.difference_distinct(
+                    lhs.obj,
+                    rhs.obj,
+                    nulls_equal=plc.types.NullEquality.EQUAL,
+                    nans_equal=plc.types.NanEquality.ALL_EQUAL,
                     stream=df.stream,
                 ),
                 dtype=self.dtype,

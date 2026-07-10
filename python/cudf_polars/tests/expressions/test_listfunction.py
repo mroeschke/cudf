@@ -86,3 +86,17 @@ def test_list_sort(engine: pl.GPUEngine, descending, nulls_last) -> None:
         pl.col("a").list.sort(descending=descending, nulls_last=nulls_last)
     )
     assert_gpu_result_equal(query, engine=engine)
+
+
+def test_list_set_difference(engine: pl.GPUEngine) -> None:
+    ldf = pl.LazyFrame(
+        {
+            "a": [[1, 2, 2, 3], [], [None, 3], None],
+            "b": [[2, 4], [3], [3, None], [1]],
+        }
+    )
+    query = ldf.select(
+        columns=pl.col("a").list.set_difference("b"),
+        literal=pl.col("a").list.set_difference([2, 3]),
+    )
+    assert_gpu_result_equal(query, engine=engine)
