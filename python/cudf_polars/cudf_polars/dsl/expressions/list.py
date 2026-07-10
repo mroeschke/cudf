@@ -58,6 +58,7 @@ class ListFunction(Expr):
     _valid_set_operations: ClassVar[set[str]] = {
         "difference",
         "intersection",
+        "symmetric_difference",
         "union",
     }
     __slots__ = ("name", "options")
@@ -172,6 +173,29 @@ class ListFunction(Expr):
         if self.name is ListFunction.Name.SetOperation:
             lhs, rhs = columns
             (operation,) = self.options
+            if operation == "symmetric_difference":
+                lhs_only = plc.lists.difference_distinct(
+                    lhs.obj,
+                    rhs.obj,
+                    nulls_equal=plc.types.NullEquality.EQUAL,
+                    nans_equal=plc.types.NanEquality.ALL_EQUAL,
+                    stream=df.stream,
+                )
+                rhs_only = plc.lists.difference_distinct(
+                    rhs.obj,
+                    lhs.obj,
+                    nulls_equal=plc.types.NullEquality.EQUAL,
+                    nans_equal=plc.types.NanEquality.ALL_EQUAL,
+                    stream=df.stream,
+                )
+                result = plc.lists.union_distinct(
+                    lhs_only,
+                    rhs_only,
+                    nulls_equal=plc.types.NullEquality.EQUAL,
+                    nans_equal=plc.types.NanEquality.ALL_EQUAL,
+                    stream=df.stream,
+                )
+                return Column(result, dtype=self.dtype)
             function = {
                 "difference": plc.lists.difference_distinct,
                 "intersection": plc.lists.intersect_distinct,
