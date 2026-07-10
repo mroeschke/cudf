@@ -33,6 +33,7 @@ class ListFunction(Expr):
         Contains = auto()
         DropNulls = auto()
         Get = auto()
+        Length = auto()
 
         @classmethod
         def from_polars(cls, obj: Any) -> Self:
@@ -47,6 +48,7 @@ class ListFunction(Expr):
         Name.Contains,
         Name.DropNulls,
         Name.Get,
+        Name.Length,
     }
     __slots__ = ("name", "options")
     _non_child = ("dtype", "name", "options")
@@ -127,6 +129,16 @@ class ListFunction(Expr):
                     stream=df.stream,
                 )
             return Column(contains, dtype=self.dtype)
+        if self.name is ListFunction.Name.Length:
+            (list_column,) = columns
+            return Column(
+                plc.unary.cast(
+                    plc.lists.count_elements(list_column.obj, stream=df.stream),
+                    self.dtype.plc_type,
+                    stream=df.stream,
+                ),
+                dtype=self.dtype,
+            )
         list_column, index = columns
         (null_on_oob,) = self.options
         if not null_on_oob:

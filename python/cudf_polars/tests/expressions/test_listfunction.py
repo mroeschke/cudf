@@ -70,3 +70,10 @@ def test_list_last(engine: pl.GPUEngine) -> None:
         pl.col("a").list.last()
     )
     assert_gpu_result_equal(query, engine=engine)
+
+
+def test_list_len(engine: pl.GPUEngine) -> None:
+    query = pl.LazyFrame({"a": [[1, 2, None], [], None, [3]]}).select(
+        pl.col("a").list.len()
+    )
+    assert_gpu_result_equal(query, engine=engine)
