@@ -100,3 +100,14 @@ def test_list_set_difference(engine: pl.GPUEngine) -> None:
         literal=pl.col("a").list.set_difference([2, 3]),
     )
     assert_gpu_result_equal(query, engine=engine)
+
+
+def test_list_set_intersection(engine: pl.GPUEngine) -> None:
+    ldf = pl.LazyFrame(
+        {
+            "a": [[1, 2, 2, 3], [], [None, 3], None],
+            "b": [[2, 4], [3], [3, None], [1]],
+        }
+    )
+    query = ldf.select(pl.col("a").list.set_intersection("b"))
+    assert_gpu_result_equal(query, engine=engine)

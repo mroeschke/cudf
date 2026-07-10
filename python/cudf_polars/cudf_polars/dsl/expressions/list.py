@@ -55,7 +55,7 @@ class ListFunction(Expr):
         Name.SetOperation,
         Name.Sort,
     }
-    _valid_set_operations: ClassVar[set[str]] = {"difference"}
+    _valid_set_operations: ClassVar[set[str]] = {"difference", "intersection"}
     __slots__ = ("name", "options")
     _non_child = ("dtype", "name", "options")
 
@@ -167,8 +167,14 @@ class ListFunction(Expr):
             )
         if self.name is ListFunction.Name.SetOperation:
             lhs, rhs = columns
+            (operation,) = self.options
+            function = (
+                plc.lists.difference_distinct
+                if operation == "difference"
+                else plc.lists.intersect_distinct
+            )
             return Column(
-                plc.lists.difference_distinct(
+                function(
                     lhs.obj,
                     rhs.obj,
                     nulls_equal=plc.types.NullEquality.EQUAL,
