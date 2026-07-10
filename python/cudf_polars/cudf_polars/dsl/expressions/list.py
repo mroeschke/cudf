@@ -28,6 +28,7 @@ class ListFunction(Expr):
         """Internal representation of Polars list functions."""
 
         Concat = auto()
+        Contains = auto()
 
         @classmethod
         def from_polars(cls, obj: Any) -> Self:
@@ -37,7 +38,7 @@ class ListFunction(Expr):
                 raise ValueError("ListFunction required")
             return getattr(cls, name)
 
-    _valid_ops: ClassVar[set[Name]] = {Name.Concat}
+    _valid_ops: ClassVar[set[Name]] = {Name.Concat, Name.Contains}
     __slots__ = ("name", "options")
     _non_child = ("dtype", "name", "options")
 
@@ -64,24 +65,36 @@ class ListFunction(Expr):
             *(child.evaluate(df, context=context) for child in self.children),
             stream=df.stream,
         )
-        result = plc.lists.concatenate_rows(
-            plc.Table([column.obj for column in columns]), stream=df.stream
-        )
-        if any(column.null_count for column in columns):
-            valid = functools.reduce(
-                lambda left, right: plc.binaryop.binary_operation(
-                    left,
-                    right,
-                    plc.binaryop.BinaryOperator.LOGICAL_AND,
-                    plc.DataType(plc.TypeId.BOOL8),
-                    stream=df.stream,
-                ),
-                (
-                    plc.unary.is_valid(column.obj, stream=df.stream)
-                    for column in columns
-                ),
+        if self.name is ListFunction.Name.Concat:
+            result = plc.lists.concatenate_rows(
+                plc.Table([column.obj for column in columns]), stream=df.stream
             )
-            result = result.with_mask(
-                *plc.transform.bools_to_mask(valid, stream=df.stream)
+            if any(column.null_count for column in columns):
+                valid = functools.reduce(
+                    lambda left, right: plc.binaryop.binary_operation(
+                        left,
+                        right,
+                        plc.binaryop.BinaryOperator.LOGICAL_AND,
+                        plc.DataType(plc.TypeId.BOOL8),
+                        stream=df.stream,
+                    ),
+                    (
+                        plc.unary.is_valid(column.obj, stream=df.stream)
+                        for column in columns
+                    ),
+                )
+                result = result.with_mask(
+                    *plc.transform.bools_to_mask(valid, stream=df.stream)
+                )
+            return Column(result, dtype=self.dtype)
+        list_column, item = columns
+        contains = plc.lists.contains(list_column.obj, item.obj, stream=df.stream)
+        (nulls_equal,) = self.options
+        if nulls_equal and item.null_count:
+            contains = plc.copying.copy_if_else(
+                plc.lists.contains_nulls(list_column.obj, stream=df.stream),
+                contains,
+                plc.unary.is_null(item.obj, stream=df.stream),
+                stream=df.stream,
             )
-        return Column(result, dtype=self.dtype)
+        return Column(contains, dtype=self.dtype)
