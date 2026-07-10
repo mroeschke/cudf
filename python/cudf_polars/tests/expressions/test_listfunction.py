@@ -56,3 +56,10 @@ def test_list_get_oob_raises(engine: pl.GPUEngine) -> None:
     query = pl.LazyFrame({"a": [[1], []]}).select(pl.col("a").list.get(0))
     with pytest.raises(pl.exceptions.ComputeError):
         query.collect(engine=engine)
+
+
+def test_list_first(engine: pl.GPUEngine) -> None:
+    query = pl.LazyFrame({"a": [[1, 2], [], None, [None]]}).select(
+        pl.col("a").list.first()
+    )
+    assert_gpu_result_equal(query, engine=engine)
