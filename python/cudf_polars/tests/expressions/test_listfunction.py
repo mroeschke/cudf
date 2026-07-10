@@ -32,3 +32,9 @@ def test_list_contains(engine: pl.GPUEngine, nulls_equal) -> None:
         pl.col("a").list.contains(pl.col("item"), nulls_equal=nulls_equal)
     )
     assert_gpu_result_equal(query, engine=engine)
+
+
+def test_list_drop_nulls(engine: pl.GPUEngine) -> None:
+    ldf = pl.LazyFrame({"a": [[None, 1, None, 2], [None], [], None, [3, 4]]})
+    query = ldf.select(pl.col("a").list.drop_nulls())
+    assert_gpu_result_equal(query, engine=engine)

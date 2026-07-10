@@ -29,6 +29,7 @@ class ListFunction(Expr):
 
         Concat = auto()
         Contains = auto()
+        DropNulls = auto()
 
         @classmethod
         def from_polars(cls, obj: Any) -> Self:
@@ -38,7 +39,7 @@ class ListFunction(Expr):
                 raise ValueError("ListFunction required")
             return getattr(cls, name)
 
-    _valid_ops: ClassVar[set[Name]] = {Name.Concat, Name.Contains}
+    _valid_ops: ClassVar[set[Name]] = {Name.Concat, Name.Contains, Name.DropNulls}
     __slots__ = ("name", "options")
     _non_child = ("dtype", "name", "options")
 
@@ -87,6 +88,25 @@ class ListFunction(Expr):
                     *plc.transform.bools_to_mask(valid, stream=df.stream)
                 )
             return Column(result, dtype=self.dtype)
+        if self.name is ListFunction.Name.DropNulls:
+            (list_column,) = columns
+            child = list_column.obj.child(1)
+            mask = plc.Column(
+                plc.DataType(plc.TypeId.LIST),
+                list_column.obj.size(),
+                None,
+                list_column.obj.null_mask(),
+                list_column.obj.null_count(),
+                list_column.obj.offset(),
+                [
+                    list_column.obj.child(0),
+                    plc.unary.is_valid(child, stream=df.stream),
+                ],
+            )
+            return Column(
+                plc.lists.apply_boolean_mask(list_column.obj, mask, stream=df.stream),
+                dtype=self.dtype,
+            )
         list_column, item = columns
         contains = plc.lists.contains(list_column.obj, item.obj, stream=df.stream)
         (nulls_equal,) = self.options
