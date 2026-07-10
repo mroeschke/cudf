@@ -23,7 +23,33 @@ if TYPE_CHECKING:
 
     from cudf_polars.containers import DataFrame, DataType
 
-__all__ = ["ListFunction"]
+__all__ = ["Explode", "ListFunction"]
+
+
+class Explode(Expr):
+    __slots__ = ("options",)
+    _non_child = ("dtype", "options")
+
+    def __init__(
+        self, dtype: DataType, options: tuple[bool, bool], child: Expr
+    ) -> None:
+        self.dtype = dtype
+        self.options = options
+        self.children = (child,)
+        self.is_pointwise = False
+        if self.options != (True, True):
+            raise NotImplementedError(f"Explode options {self.options!r}")
+
+    def do_evaluate(
+        self, df: DataFrame, *, context: ExecutionContext = ExecutionContext.FRAME
+    ) -> Column:
+        """Evaluate this expression given a dataframe for context."""
+        (child,) = self.children
+        column = child.evaluate(df, context=context)
+        result = plc.lists.explode_outer(
+            plc.Table([column.obj]), 0, stream=df.stream
+        ).columns()[0]
+        return Column(result, dtype=self.dtype)
 
 
 class ListFunction(Expr):

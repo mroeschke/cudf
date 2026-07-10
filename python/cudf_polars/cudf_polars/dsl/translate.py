@@ -1440,6 +1440,23 @@ def _(
     )
 
 
+def _translate_explode(
+    node: Any,
+    translator: Translator,
+    dtype: DataType,
+    schema: Schema,
+) -> expr.Expr:
+    return expr.Explode(
+        dtype,
+        node.options,
+        translator.translate_expr(n=node.expr, schema=schema),
+    )
+
+
+if hasattr(plrs._expr_nodes, "Explode"):
+    _translate_expr.register(plrs._expr_nodes.Explode)(_translate_explode)
+
+
 @_translate_expr.register
 def _(
     node: plrs._expr_nodes.Len, translator: Translator, dtype: DataType, schema: Schema

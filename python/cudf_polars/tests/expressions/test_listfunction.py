@@ -6,7 +6,10 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import (
+    assert_gpu_result_equal,
+    assert_ir_translation_raises,
+)
 
 
 def test_list_concat(engine: pl.GPUEngine) -> None:
@@ -89,6 +92,26 @@ def test_list_len(engine: pl.GPUEngine) -> None:
         pl.col("a").list.len()
     )
     assert_gpu_result_equal(query, engine=engine)
+
+
+def test_list_explode(engine: pl.GPUEngine) -> None:
+    query = pl.LazyFrame({"a": [[1, 2], [], None, [None], [3]]}).select(
+        pl.col("a").list.explode()
+    )
+    assert_gpu_result_equal(query, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "empty_as_null,keep_nulls",
+    [(False, True), (True, False)],
+)
+def test_list_explode_unsupported_options(
+    engine: pl.GPUEngine, empty_as_null, keep_nulls
+) -> None:
+    query = pl.LazyFrame({"a": [[1], [], None]}).select(
+        pl.col("a").list.explode(empty_as_null=empty_as_null, keep_nulls=keep_nulls)
+    )
+    assert_ir_translation_raises(query, engine, NotImplementedError)
 
 
 @pytest.mark.parametrize("descending", [False, True])
