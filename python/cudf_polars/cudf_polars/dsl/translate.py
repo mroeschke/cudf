@@ -879,7 +879,14 @@ def _(
 ) -> expr.Expr:
     name, *options = node.function_data
     options = tuple(options)
-    if isinstance(name, plrs._expr_nodes.StringFunction):
+    if isinstance(name, getattr(plrs._expr_nodes, "ListFunction", ())):
+        return expr.ListFunction(
+            dtype,
+            expr.ListFunction.Name.from_polars(name),
+            options,
+            *(translator.translate_expr(n=n, schema=schema) for n in node.input),
+        )
+    elif isinstance(name, plrs._expr_nodes.StringFunction):
         if name in {
             plrs._expr_nodes.StringFunction.StripChars,
             plrs._expr_nodes.StringFunction.StripCharsStart,

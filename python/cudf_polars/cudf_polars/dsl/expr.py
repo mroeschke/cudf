@@ -24,6 +24,7 @@ from cudf_polars.dsl.expressions.base import (
 from cudf_polars.dsl.expressions.binaryop import BinOp
 from cudf_polars.dsl.expressions.boolean import BooleanFunction
 from cudf_polars.dsl.expressions.datetime import TemporalFunction
+from cudf_polars.dsl.expressions.list import ListFunction
 from cudf_polars.dsl.expressions.literal import Literal, LiteralColumn
 from cudf_polars.dsl.expressions.rolling import GroupedWindow, RollingWindow
 from cudf_polars.dsl.expressions.selection import Filter, Gather
@@ -48,6 +49,7 @@ __all__ = [
     "GroupedWindow",
     "Item",
     "Len",
+    "ListFunction",
     "Literal",
     "LiteralColumn",
     "NamedExpr",
