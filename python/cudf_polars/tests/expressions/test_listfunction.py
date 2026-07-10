@@ -20,6 +20,18 @@ def test_list_concat(engine: pl.GPUEngine) -> None:
     assert_gpu_result_equal(query, engine=engine)
 
 
+def test_concat_list(engine: pl.GPUEngine) -> None:
+    ldf = pl.LazyFrame(
+        {
+            "a": [[1, 2], [], None, [None]],
+            "b": [[3], [4, 5], [6], None],
+            "c": [7, 8, 9, 10],
+        }
+    )
+    query = ldf.select(pl.concat_list("a", "b", "c"))
+    assert_gpu_result_equal(query, engine=engine)
+
+
 @pytest.mark.parametrize("nulls_equal", [False, True])
 def test_list_contains(engine: pl.GPUEngine, nulls_equal) -> None:
     ldf = pl.LazyFrame(

@@ -93,10 +93,33 @@ class ListFunction(Expr):
             stream=df.stream,
         )
         if self.name is ListFunction.Name.Concat:
+            list_columns = []
+            for column in columns:
+                if column.dtype.id() == plc.TypeId.LIST:
+                    list_columns.append(column.obj)
+                else:
+                    int32 = plc.DataType(plc.TypeId.INT32)
+                    offsets = plc.filling.sequence(
+                        column.size + 1,
+                        plc.Scalar.from_py(0, int32, stream=df.stream),
+                        plc.Scalar.from_py(1, int32, stream=df.stream),
+                        stream=df.stream,
+                    )
+                    list_columns.append(
+                        plc.Column(
+                            plc.DataType(plc.TypeId.LIST),
+                            column.size,
+                            None,
+                            None,
+                            0,
+                            0,
+                            [offsets, column.obj],
+                        )
+                    )
             result = plc.lists.concatenate_rows(
-                plc.Table([column.obj for column in columns]), stream=df.stream
+                plc.Table(list_columns), stream=df.stream
             )
-            if any(column.null_count for column in columns):
+            if any(column.null_count() for column in list_columns):
                 valid = functools.reduce(
                     lambda left, right: plc.binaryop.binary_operation(
                         left,
@@ -106,8 +129,8 @@ class ListFunction(Expr):
                         stream=df.stream,
                     ),
                     (
-                        plc.unary.is_valid(column.obj, stream=df.stream)
-                        for column in columns
+                        plc.unary.is_valid(column, stream=df.stream)
+                        for column in list_columns
                     ),
                 )
                 result = result.with_mask(
