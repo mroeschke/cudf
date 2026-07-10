@@ -247,9 +247,19 @@ class ListFunction(Expr):
                 return Column(result, dtype=self.dtype)
             function = {
                 "difference": plc.lists.difference_distinct,
-                "intersection": plc.lists.intersect_distinct,
                 "union": plc.lists.union_distinct,
-            }[operation]
+            }.get(operation)
+            if function is None:
+                return Column(
+                    plc.lists.intersect_distinct(
+                        rhs.obj,
+                        lhs.obj,
+                        nulls_equal=plc.types.NullEquality.EQUAL,
+                        nans_equal=plc.types.NanEquality.ALL_EQUAL,
+                        stream=df.stream,
+                    ),
+                    dtype=self.dtype,
+                )
             return Column(
                 function(
                     lhs.obj,

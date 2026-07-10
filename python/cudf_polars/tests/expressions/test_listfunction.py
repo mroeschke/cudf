@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import operator
+
 import pytest
 
 import polars as pl
@@ -9,6 +11,13 @@ import polars as pl
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
     assert_ir_translation_raises,
+)
+
+plrs = operator.attrgetter("polars")(pl)
+pytestmark = pytest.mark.skipif(
+    not hasattr(plrs._expr_nodes, "ListFunction")
+    or not hasattr(plrs._expr_nodes, "Explode"),
+    reason="List expression nodes are not exposed by Polars",
 )
 
 
