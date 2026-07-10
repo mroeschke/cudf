@@ -9,6 +9,8 @@ import functools
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from polars.exceptions import ComputeError
+
 import pylibcudf as plc
 
 from cudf_polars.containers import Column
@@ -30,6 +32,7 @@ class ListFunction(Expr):
         Concat = auto()
         Contains = auto()
         DropNulls = auto()
+        Get = auto()
 
         @classmethod
         def from_polars(cls, obj: Any) -> Self:
@@ -39,7 +42,12 @@ class ListFunction(Expr):
                 raise ValueError("ListFunction required")
             return getattr(cls, name)
 
-    _valid_ops: ClassVar[set[Name]] = {Name.Concat, Name.Contains, Name.DropNulls}
+    _valid_ops: ClassVar[set[Name]] = {
+        Name.Concat,
+        Name.Contains,
+        Name.DropNulls,
+        Name.Get,
+    }
     __slots__ = ("name", "options")
     _non_child = ("dtype", "name", "options")
 
@@ -107,14 +115,59 @@ class ListFunction(Expr):
                 plc.lists.apply_boolean_mask(list_column.obj, mask, stream=df.stream),
                 dtype=self.dtype,
             )
-        list_column, item = columns
-        contains = plc.lists.contains(list_column.obj, item.obj, stream=df.stream)
-        (nulls_equal,) = self.options
-        if nulls_equal and item.null_count:
-            contains = plc.copying.copy_if_else(
-                plc.lists.contains_nulls(list_column.obj, stream=df.stream),
-                contains,
-                plc.unary.is_null(item.obj, stream=df.stream),
+        if self.name is ListFunction.Name.Contains:
+            list_column, item = columns
+            contains = plc.lists.contains(list_column.obj, item.obj, stream=df.stream)
+            (nulls_equal,) = self.options
+            if nulls_equal and item.null_count:
+                contains = plc.copying.copy_if_else(
+                    plc.lists.contains_nulls(list_column.obj, stream=df.stream),
+                    contains,
+                    plc.unary.is_null(item.obj, stream=df.stream),
+                    stream=df.stream,
+                )
+            return Column(contains, dtype=self.dtype)
+        list_column, index = columns
+        (null_on_oob,) = self.options
+        if not null_on_oob:
+            lengths = plc.unary.cast(
+                plc.lists.count_elements(list_column.obj, stream=df.stream),
+                index.obj.type(),
                 stream=df.stream,
             )
-        return Column(contains, dtype=self.dtype)
+            upper_oob = plc.binaryop.binary_operation(
+                index.obj,
+                lengths,
+                plc.binaryop.BinaryOperator.GREATER_EQUAL,
+                plc.DataType(plc.TypeId.BOOL8),
+                stream=df.stream,
+            )
+            lower_oob = plc.binaryop.binary_operation(
+                index.obj,
+                plc.unary.unary_operation(
+                    lengths, plc.unary.UnaryOperator.NEGATE, stream=df.stream
+                ),
+                plc.binaryop.BinaryOperator.LESS,
+                plc.DataType(plc.TypeId.BOOL8),
+                stream=df.stream,
+            )
+            oob = plc.binaryop.binary_operation(
+                upper_oob,
+                lower_oob,
+                plc.binaryop.BinaryOperator.LOGICAL_OR,
+                plc.DataType(plc.TypeId.BOOL8),
+                stream=df.stream,
+            )
+            if plc.reduce.reduce(
+                oob,
+                plc.aggregation.any(),
+                plc.DataType(plc.TypeId.BOOL8),
+                stream=df.stream,
+            ).to_py(stream=df.stream):
+                raise ComputeError("get index is out of bounds")
+        return Column(
+            plc.lists.extract_list_element(
+                list_column.obj, index.obj, stream=df.stream
+            ),
+            dtype=self.dtype,
+        )

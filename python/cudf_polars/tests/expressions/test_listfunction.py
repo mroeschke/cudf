@@ -38,3 +38,21 @@ def test_list_drop_nulls(engine: pl.GPUEngine) -> None:
     ldf = pl.LazyFrame({"a": [[None, 1, None, 2], [None], [], None, [3, 4]]})
     query = ldf.select(pl.col("a").list.drop_nulls())
     assert_gpu_result_equal(query, engine=engine)
+
+
+@pytest.mark.parametrize("null_on_oob", [False, True])
+def test_list_get(engine: pl.GPUEngine, null_on_oob) -> None:
+    ldf = pl.LazyFrame(
+        {
+            "a": [[1, 2], [3], [4], None],
+            "index": [0, -1, 0, 0],
+        }
+    )
+    query = ldf.select(pl.col("a").list.get(pl.col("index"), null_on_oob=null_on_oob))
+    assert_gpu_result_equal(query, engine=engine)
+
+
+def test_list_get_oob_raises(engine: pl.GPUEngine) -> None:
+    query = pl.LazyFrame({"a": [[1], []]}).select(pl.col("a").list.get(0))
+    with pytest.raises(pl.exceptions.ComputeError):
+        query.collect(engine=engine)
