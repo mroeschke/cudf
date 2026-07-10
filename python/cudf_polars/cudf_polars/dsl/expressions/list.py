@@ -16,6 +16,7 @@ import pylibcudf as plc
 from cudf_polars.containers import Column
 from cudf_polars.dsl.expressions.base import ExecutionContext, Expr
 from cudf_polars.dsl.utils.reshape import broadcast
+from cudf_polars.utils import sorting
 
 if TYPE_CHECKING:
     from typing import Self
@@ -34,6 +35,7 @@ class ListFunction(Expr):
         DropNulls = auto()
         Get = auto()
         Length = auto()
+        Sort = auto()
 
         @classmethod
         def from_polars(cls, obj: Any) -> Self:
@@ -49,6 +51,7 @@ class ListFunction(Expr):
         Name.DropNulls,
         Name.Get,
         Name.Length,
+        Name.Sort,
     }
     __slots__ = ("name", "options")
     _non_child = ("dtype", "name", "options")
@@ -135,6 +138,21 @@ class ListFunction(Expr):
                 plc.unary.cast(
                     plc.lists.count_elements(list_column.obj, stream=df.stream),
                     self.dtype.plc_type,
+                    stream=df.stream,
+                ),
+                dtype=self.dtype,
+            )
+        if self.name is ListFunction.Name.Sort:
+            (list_column,) = columns
+            descending, nulls_last = self.options
+            order, null_order = sorting.sort_order(
+                [descending], nulls_last=[nulls_last], num_keys=1
+            )
+            return Column(
+                plc.lists.sort_lists(
+                    list_column.obj,
+                    order[0],
+                    null_order[0],
                     stream=df.stream,
                 ),
                 dtype=self.dtype,

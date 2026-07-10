@@ -77,3 +77,12 @@ def test_list_len(engine: pl.GPUEngine) -> None:
         pl.col("a").list.len()
     )
     assert_gpu_result_equal(query, engine=engine)
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("nulls_last", [False, True])
+def test_list_sort(engine: pl.GPUEngine, descending, nulls_last) -> None:
+    query = pl.LazyFrame({"a": [[3, 1, 2], [None, 2, 1], [], None]}).select(
+        pl.col("a").list.sort(descending=descending, nulls_last=nulls_last)
+    )
+    assert_gpu_result_equal(query, engine=engine)
