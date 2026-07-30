@@ -274,6 +274,38 @@ class ParquetOptions:
         Maximum number of destination buffers fused into a single scatter GET
         in the cuCascade REST engine. Only used when ``prefetch_backend`` is
         ``"cucascade"``. When ``None``, uses the cuCascade engine default (16).
+    cucascade_enable_prefetch_cache
+        Whether to arm the cuCascade prefetch cache so ``fadvise`` +
+        ``activate`` stage advised ranges into pinned host memory ahead of the
+        consuming reads. Only used when ``prefetch_backend`` is ``"cucascade"``.
+        Default is ``False`` (reads go straight to the backend).
+    cucascade_cache_pool_capacity
+        Size in bytes of the dedicated pinned host pool backing the cuCascade
+        prefetch cache, separate from the reactor staging pool. Only used when
+        ``prefetch_backend`` is ``"cucascade"`` and
+        ``cucascade_enable_prefetch_cache`` is ``True``. When ``None``, uses the
+        cuCascade engine default.
+    cucascade_inflight_io_chunk_budget
+        Maximum concurrent in-flight prefetch chunks in the cuCascade cache.
+        Only used when ``prefetch_backend`` is ``"cucascade"`` and
+        ``cucascade_enable_prefetch_cache`` is ``True``. When ``None``, uses the
+        cuCascade engine default (2048).
+    cucascade_min_prefetching_budget_fraction
+        Fraction of the cuCascade cache pool reserved for prefetch. Only used
+        when ``prefetch_backend`` is ``"cucascade"`` and
+        ``cucascade_enable_prefetch_cache`` is ``True``. When ``None``, uses the
+        cuCascade engine default (0.05).
+    cucascade_eviction_threshold_fraction
+        Pool-occupancy fraction at which cuCascade cache eviction starts. Only
+        used when ``prefetch_backend`` is ``"cucascade"`` and
+        ``cucascade_enable_prefetch_cache`` is ``True``. When ``None``, uses the
+        cuCascade engine default (0.6).
+    cucascade_dispose_after_use
+        Whether the cuCascade cache reclaims staged chunks immediately after
+        consumption. Recommended for a single streaming pass over a working set
+        much larger than the cache pool. Only used when ``prefetch_backend`` is
+        ``"cucascade"`` and ``cucascade_enable_prefetch_cache`` is ``True``.
+        Default is ``False``.
     use_jit_filter
         Whether to use JIT compilation for post-read filtering in Parquet scans.
         When enabled, filter predicates are JIT-compiled to CUDA kernels for
@@ -371,6 +403,44 @@ class ParquetOptions:
             f"{_env_prefix}__CUCASCADE_MAX_N_CHUNKS", int, default=None
         )
     )
+    cucascade_enable_prefetch_cache: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__CUCASCADE_ENABLE_PREFETCH_CACHE",
+            _bool_converter,
+            default=False,
+        )
+    )
+    cucascade_cache_pool_capacity: int | None = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__CUCASCADE_CACHE_POOL_CAPACITY", int, default=None
+        )
+    )
+    cucascade_inflight_io_chunk_budget: int | None = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__CUCASCADE_INFLIGHT_IO_CHUNK_BUDGET", int, default=None
+        )
+    )
+    cucascade_min_prefetching_budget_fraction: float | None = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__CUCASCADE_MIN_PREFETCHING_BUDGET_FRACTION",
+            float,
+            default=None,
+        )
+    )
+    cucascade_eviction_threshold_fraction: float | None = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__CUCASCADE_EVICTION_THRESHOLD_FRACTION",
+            float,
+            default=None,
+        )
+    )
+    cucascade_dispose_after_use: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__CUCASCADE_DISPOSE_AFTER_USE",
+            _bool_converter,
+            default=False,
+        )
+    )
     use_jit_filter: bool = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__USE_JIT_FILTER",
@@ -433,6 +503,30 @@ class ParquetOptions:
             self.cucascade_max_n_chunks, int
         ):
             raise TypeError("cucascade_max_n_chunks must be an int or None")
+        if not isinstance(self.cucascade_enable_prefetch_cache, bool):
+            raise TypeError("cucascade_enable_prefetch_cache must be a bool")
+        if self.cucascade_cache_pool_capacity is not None and not isinstance(
+            self.cucascade_cache_pool_capacity, int
+        ):
+            raise TypeError("cucascade_cache_pool_capacity must be an int or None")
+        if self.cucascade_inflight_io_chunk_budget is not None and not isinstance(
+            self.cucascade_inflight_io_chunk_budget, int
+        ):
+            raise TypeError("cucascade_inflight_io_chunk_budget must be an int or None")
+        if self.cucascade_min_prefetching_budget_fraction is not None and not isinstance(
+            self.cucascade_min_prefetching_budget_fraction, float
+        ):
+            raise TypeError(
+                "cucascade_min_prefetching_budget_fraction must be a float or None"
+            )
+        if self.cucascade_eviction_threshold_fraction is not None and not isinstance(
+            self.cucascade_eviction_threshold_fraction, float
+        ):
+            raise TypeError(
+                "cucascade_eviction_threshold_fraction must be a float or None"
+            )
+        if not isinstance(self.cucascade_dispose_after_use, bool):
+            raise TypeError("cucascade_dispose_after_use must be a bool")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 

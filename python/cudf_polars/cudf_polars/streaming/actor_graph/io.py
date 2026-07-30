@@ -659,6 +659,12 @@ async def scan_node(
             cucascade_max_connections=first.parquet_options.cucascade_max_connections if first is not None else None,
             cucascade_chunk_size=first.parquet_options.cucascade_chunk_size if first is not None else None,
             cucascade_max_n_chunks=first.parquet_options.cucascade_max_n_chunks if first is not None else None,
+            cucascade_enable_prefetch_cache=first.parquet_options.cucascade_enable_prefetch_cache if first is not None else False,
+            cucascade_cache_pool_capacity=first.parquet_options.cucascade_cache_pool_capacity if first is not None else None,
+            cucascade_inflight_io_chunk_budget=first.parquet_options.cucascade_inflight_io_chunk_budget if first is not None else None,
+            cucascade_min_prefetching_budget_fraction=first.parquet_options.cucascade_min_prefetching_budget_fraction if first is not None else None,
+            cucascade_eviction_threshold_fraction=first.parquet_options.cucascade_eviction_threshold_fraction if first is not None else None,
+            cucascade_dispose_after_use=first.parquet_options.cucascade_dispose_after_use if first is not None else False,
         )
         if use_prefetch
         else None

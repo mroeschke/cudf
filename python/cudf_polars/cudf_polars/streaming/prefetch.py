@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import dataclasses
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -272,44 +273,55 @@ def prefetch_scan_byte_ranges(
     )
 
 
-def fadvise_scan_byte_ranges(
+@dataclasses.dataclass
+class AdvisedScan:
+    """Result of the advise pass for one SplitScan.
+
+    Carries the duplicated datasource whose prefetch has been armed plus the
+    planned byte ranges, so the later read pass can consume from the (warm)
+    cache. ``datasource`` is ``None`` when the split cannot use the hybrid-scan
+    path or was fully pruned, in which case ``planned`` is returned directly by
+    the read pass.
+    """
+
+    datasource: Any | None
+    planned: PrefetchedByteRanges | None
+
+
+def advise_scan_byte_ranges(
     scan: SplitScan,
     stream: Stream,
     datasource_cache: dict[str, Any],
     dev_id: int,
-    pinned_mr: PinnedMemoryResource,
-    context: Context,
-    loop: asyncio.AbstractEventLoop,
-) -> PrefetchedByteRanges | None:
+) -> AdvisedScan:
     """
-    Run stats and bloom pruning for one SplitScan and prefetch byte ranges.
+    Plan a SplitScan and arm background prefetch for its byte ranges.
+
+    This is the advise pass: it prunes row groups, computes the filter/payload
+    byte ranges, then hints and activates the prefetch cache so staging runs on
+    the engine's background reactors ahead of the consuming read pass. It issues
+    no reads.
 
     Parameters
     ----------
     scan
-        The split scan task to prefetch.
+        The split scan task to advise.
     stream
         CUDA stream used for filter expression compilation.
     datasource_cache
         Per-query cache mapping file path to its open datasource.
     dev_id
         CUDA device id for staging.
-    pinned_mr
-        Pinned memory resource to allocate host buffers from.
-    context
-        rapidsmpf context.
-    loop
-        Event loop for the calling async context.
 
     Returns
     -------
-    PrefetchedByteRanges | None
-        None when the split cannot use the hybrid-scan path, signalling
-        the producer to fall back to SplitScan.do_evaluate.
+    AdvisedScan
+        Holds the armed datasource and planned ranges, or ``datasource=None``
+        when the split cannot use the hybrid-scan path or was fully pruned.
     """
     planned = _plan_hybrid_scan_prefetch(scan, stream)
     if planned is None or not planned.row_group_indices:
-        return planned
+        return AdvisedScan(datasource=None, planned=planned)
 
     datasource = datasource_cache[scan.paths[0]].duplicate()
 
@@ -323,18 +335,69 @@ def fadvise_scan_byte_ranges(
         message=f"fadvise [{scan.split_index + 1}/{scan.total_splits}]:filter={filter_bytes}B,payload={payload_bytes}B"
     ):
         datasource.fadvise(all_ranges, dev_id)
+        # Arm opportunistic background prefetch (no-op when the cache is off).
+        datasource.activate()
 
-    # TODO: eliminate the extra copy (cuCascade bounce buffer to rapidsmpf PinnedBuffer
-    # to GPU) by having cuCascade expose the staged data as a device buffer directly.
-    filter_buf = PinnedBuffer(pinned_mr, filter_bytes, stream, context, loop)
-    payload_buf = PinnedBuffer(pinned_mr, payload_bytes, stream, context, loop)
+    return AdvisedScan(datasource=datasource, planned=planned)
 
-    filter_futures = datasource.read_ranges_async(
-        [(r.offset, r.size) for r in planned.filter_ranges], filter_buf.array
-    )
-    payload_futures = datasource.read_ranges_async(
-        [(r.offset, r.size) for r in planned.payload_ranges], payload_buf.array
-    )
+
+def read_scan_byte_ranges(
+    advised: AdvisedScan,
+    stream: Stream,
+    pinned_mr: PinnedMemoryResource,
+    context: Context,
+    loop: asyncio.AbstractEventLoop,
+) -> PrefetchedByteRanges | None:
+    """
+    Consume the byte ranges advised by :func:`advise_scan_byte_ranges`.
+
+    This is the read pass: it allocates pinned host buffers and issues the async
+    reads on the same (already-advised) datasource so they serve from the warm
+    prefetch cache when a hit is available, falling back to a direct backend read
+    otherwise.
+
+    Parameters
+    ----------
+    advised
+        The result of the advise pass for this split.
+    stream
+        CUDA stream used for pinned buffer allocation.
+    pinned_mr
+        Pinned memory resource to allocate host buffers from.
+    context
+        rapidsmpf context.
+    loop
+        Event loop for the calling async context.
+
+    Returns
+    -------
+    PrefetchedByteRanges | None
+        None when the split cannot use the hybrid-scan path, signalling
+        the producer to fall back to SplitScan.do_evaluate.
+    """
+    planned = advised.planned
+    datasource = advised.datasource
+    if datasource is None or planned is None:
+        return planned
+
+    filter_bytes = sum(r.size for r in planned.filter_ranges)
+    payload_bytes = sum(r.size for r in planned.payload_ranges)
+
+    with nvtx_annotate_cudf_polars(
+        message=f"read_filter_and_payload:filter={filter_bytes}B,payload={payload_bytes}B"
+    ):
+        # TODO: eliminate the extra copy (cuCascade bounce buffer to rapidsmpf
+        # PinnedBuffer to GPU) by having cuCascade expose the staged data as a
+        # device buffer directly.
+        filter_buf = PinnedBuffer(pinned_mr, filter_bytes, stream, context, loop)
+        payload_buf = PinnedBuffer(pinned_mr, payload_bytes, stream, context, loop)
+
+        filter_futures = datasource.read_ranges_async(
+            [(r.offset, r.size) for r in planned.filter_ranges], filter_buf.array
+        )
+        payload_futures = datasource.read_ranges_async(
+            [(r.offset, r.size) for r in planned.payload_ranges], payload_buf.array
+        )
 
     return PrefetchedByteRanges(
         row_group_indices=planned.row_group_indices,
@@ -356,6 +419,12 @@ def _get_cucascade_engine(
     max_connections: int | None,
     chunk_size: int | None,
     max_n_chunks: int | None,
+    enable_prefetch_cache: bool = False,
+    cache_pool_capacity: int | None = None,
+    inflight_io_chunk_budget: int | None = None,
+    min_prefetching_budget_fraction: float | None = None,
+    eviction_threshold_fraction: float | None = None,
+    dispose_after_use: bool = False,
 ) -> Any:
     global _cucascade_engine
     if _cucascade_engine is not None:
@@ -373,6 +442,19 @@ def _get_cucascade_engine(
                 kwargs["chunk_size"] = chunk_size
             if max_n_chunks is not None:
                 kwargs["max_n_chunks"] = max_n_chunks
+            if enable_prefetch_cache:
+                kwargs["enable_prefetch_cache"] = True
+                kwargs["dispose_after_use"] = dispose_after_use
+                if cache_pool_capacity is not None:
+                    kwargs["cache_pool_capacity"] = cache_pool_capacity
+                if inflight_io_chunk_budget is not None:
+                    kwargs["inflight_io_chunk_budget"] = inflight_io_chunk_budget
+                if min_prefetching_budget_fraction is not None:
+                    kwargs["min_prefetching_budget_fraction"] = (
+                        min_prefetching_budget_fraction
+                    )
+                if eviction_threshold_fraction is not None:
+                    kwargs["eviction_threshold_fraction"] = eviction_threshold_fraction
             if plc.io.SourceInfo._is_remote_uri(path):
                 # TODO: replace with cucascade.RestEngine.from_environment() once
                 # cuCascade exposes a factory that reads standard AWS env vars directly.
@@ -427,6 +509,12 @@ class HybridScanPrefetchExecutor:
         cucascade_max_connections: int | None = None,
         cucascade_chunk_size: int | None = None,
         cucascade_max_n_chunks: int | None = None,
+        cucascade_enable_prefetch_cache: bool = False,
+        cucascade_cache_pool_capacity: int | None = None,
+        cucascade_inflight_io_chunk_budget: int | None = None,
+        cucascade_min_prefetching_budget_fraction: float | None = None,
+        cucascade_eviction_threshold_fraction: float | None = None,
+        cucascade_dispose_after_use: bool = False,
     ) -> Self:
         """
         Submit prefetch tasks for all scans.
@@ -445,6 +533,25 @@ class HybridScanPrefetchExecutor:
             Size in bytes of the cuCascade pinned host memory pool.
         cucascade_n_reactors
             Number of IO reactor threads in the cuCascade engine.
+        cucascade_max_connections
+            Max concurrent in-flight HTTP connections per reactor.
+        cucascade_chunk_size
+            Max bytes per ranged GET request.
+        cucascade_max_n_chunks
+            Max destination buffers fused into a single scatter GET.
+        cucascade_enable_prefetch_cache
+            Arm the cuCascade prefetch cache so the advise pass stages ranges
+            ahead of the read pass.
+        cucascade_cache_pool_capacity
+            Size in bytes of the dedicated cuCascade prefetch-cache pool.
+        cucascade_inflight_io_chunk_budget
+            Max concurrent in-flight prefetch chunks in the cache.
+        cucascade_min_prefetching_budget_fraction
+            Fraction of the cache pool reserved for prefetch.
+        cucascade_eviction_threshold_fraction
+            Pool-occupancy fraction at which cache eviction starts.
+        cucascade_dispose_after_use
+            Reclaim staged chunks immediately after consumption.
 
         Returns
         -------
@@ -477,6 +584,12 @@ class HybridScanPrefetchExecutor:
                 cucascade_max_connections,
                 cucascade_chunk_size,
                 cucascade_max_n_chunks,
+                enable_prefetch_cache=cucascade_enable_prefetch_cache,
+                cache_pool_capacity=cucascade_cache_pool_capacity,
+                inflight_io_chunk_budget=cucascade_inflight_io_chunk_budget,
+                min_prefetching_budget_fraction=cucascade_min_prefetching_budget_fraction,
+                eviction_threshold_fraction=cucascade_eviction_threshold_fraction,
+                dispose_after_use=cucascade_dispose_after_use,
             )
 
             _, dev_id = cudart.cudaGetDevice()
@@ -495,11 +608,27 @@ class HybridScanPrefetchExecutor:
                 if path not in datasource_cache:
                     datasource_cache[path] = engine.open(path)
 
-            def task(s: SplitScan) -> PrefetchedByteRanges | None:
-                return fadvise_scan_byte_ranges(
-                    s, cls.thread_local.stream, datasource_cache, dev_id,
-                    pinned_mr, context, loop,
+            # Two-pass pipeline: submit the advise pass (plan + fadvise + activate)
+            # for every split first so background prefetch is armed, then submit the
+            # read pass. Because all advise tasks are queued ahead of the read tasks
+            # on the same pool, they drain first and give the cache lead time.
+            def advise_task(s: SplitScan) -> AdvisedScan:
+                return advise_scan_byte_ranges(
+                    s, cls.thread_local.stream, datasource_cache, dev_id
                 )
+
+            advise_futures = [executor.submit(advise_task, scan) for scan in scans]
+
+            def read_task(idx: int) -> PrefetchedByteRanges | None:
+                return read_scan_byte_ranges(
+                    advise_futures[idx].result(),
+                    cls.thread_local.stream,
+                    pinned_mr,
+                    context,
+                    loop,
+                )
+
+            futures = [executor.submit(read_task, i) for i in range(len(scans))]
 
         else:
             datasource_cache = {}
@@ -516,7 +645,8 @@ class HybridScanPrefetchExecutor:
                     s, cls.thread_local.stream, pinned_mr, context, loop
                 )
 
-        futures = [executor.submit(task, scan) for scan in scans]
+            futures = [executor.submit(task, scan) for scan in scans]
+
         return cls(
             futures,
             executor,
