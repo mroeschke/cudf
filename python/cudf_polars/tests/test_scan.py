@@ -1037,3 +1037,61 @@ def test_scan_parquet_hive_partitioned_null_value(
     )
     q = pl.scan_parquet(tmp_path / "hive", hive_partitioning=True)
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@requires_hive_ir
+@pytest.mark.parametrize(
+    "query",
+    [
+        lambda lf: lf,
+        lambda lf: lf.select("part"),
+        lambda lf: lf.filter(pl.col("part") > 1),
+        lambda lf: lf.filter(pl.col("a") > 4),
+    ],
+)
+def test_scan_parquet_hive_partitioned_chunked(hive_root: Path, query) -> None:
+    q = query(pl.scan_parquet(hive_root, hive_partitioning=True))
+    assert_gpu_result_equal(
+        q,
+        engine=pl.GPUEngine(
+            executor="in-memory",
+            raise_on_fail=True,
+            parquet_options={"chunked": True, "chunk_read_limit": 1},
+        ),
+        check_row_order=False,
+    )
+
+
+@requires_hive_ir
+@pytest.mark.parametrize(
+    "dtype",
+    [pl.Date, pl.Datetime("us"), pl.Float64, pl.Boolean, pl.Int64, pl.String],
+)
+@pytest.mark.parametrize(
+    "query", [lambda lf: lf, lambda lf: lf.select("part")], ids=["all", "hive_only"]
+)
+def test_scan_parquet_hive_partitioned_dtypes(
+    engine: pl.GPUEngine, tmp_path: Path, dtype: pl.DataType, query
+) -> None:
+    values = pl.Series([0, 1, 1, 0], dtype=pl.Int64).cast(dtype, strict=False)
+    root = tmp_path / "hive"
+    pl.DataFrame({"a": [1, 2, 3, 4], "part": values}).write_parquet(
+        root, partition_by=["part"]
+    )
+    q = query(pl.scan_parquet(root, hive_schema={"part": dtype}))
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@requires_hive_ir
+def test_scan_parquet_hive_partitioned_uniform_multiple_files(
+    engine: pl.GPUEngine, tmp_path: Path
+) -> None:
+    # Several files under one partition, so every row gets the same hive value
+    # and the values can be broadcast rather than gathered.
+    (tmp_path / "part=1").mkdir()
+    for index in range(3):
+        pl.DataFrame({"a": [index, index + 1]}).write_parquet(
+            tmp_path / "part=1" / f"{index}.parquet"
+        )
+    q = pl.scan_parquet(tmp_path, hive_schema={"part": pl.Int32})
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
