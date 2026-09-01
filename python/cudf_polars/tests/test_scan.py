@@ -893,14 +893,103 @@ def test_scan_parquet_is_between_literal_dtype_mismatch_22622(
     assert_gpu_result_equal(q, engine=engine)
 
 
-@pytest.mark.skipif(
+requires_hive_ir = pytest.mark.skipif(
     POLARS_VERSION_LT_142,
     reason="hive::HivePartitionedDf not exposed in the logical plan before 1.42",
 )
-def test_scan_parquet_hive_partitioned_raises(
-    engine: pl.GPUEngine, tmp_path: Path
+
+
+@pytest.fixture
+def hive_root(tmp_path: Path) -> Path:
+    """A dataset partitioned by two keys, with differing rows per file."""
+    root = tmp_path / "hive"
+    pl.DataFrame(
+        {
+            "a": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "b": ["x", "y", "z", "w", "p", "q", "r", "s", "t"],
+            "part": [1, 1, 1, 2, 2, 3, 3, 4, 4],
+            "cat": ["u", "u", "u", "u", "u", "v", "v", "v", "v"],
+        }
+    ).write_parquet(root, partition_by=["cat", "part"])
+    return root
+
+
+@requires_hive_ir
+@pytest.mark.parametrize(
+    "query",
+    [
+        lambda lf: lf,
+        lambda lf: lf.select("a"),
+        lambda lf: lf.select("part"),
+        lambda lf: lf.select("part", "cat"),
+        lambda lf: lf.select("part", "a"),
+        lambda lf: lf.select("cat", "b", "part"),
+        lambda lf: lf.filter(pl.col("part") == 2),
+        lambda lf: lf.filter(pl.col("part") >= 3),
+        lambda lf: lf.filter(pl.col("part") == 99),
+        lambda lf: lf.filter(pl.col("cat") == "v"),
+        lambda lf: lf.filter(pl.col("a") > 4),
+        lambda lf: lf.filter((pl.col("part") >= 3) & (pl.col("a") > 6)),
+        lambda lf: lf.filter((pl.col("cat") == "v") | (pl.col("a") > 6)),
+        lambda lf: lf.filter(pl.col("part") > pl.col("a")),
+        lambda lf: lf.filter(pl.col("part").is_in([1, 3])),
+        lambda lf: lf.filter(pl.col("part") % 2 == 0).select("part"),
+        lambda lf: lf.filter(pl.col("a") > 3).select("part"),
+        lambda lf: lf.head(4),
+        lambda lf: lf.select("part").head(4),
+        lambda lf: lf.slice(2, 5),
+        lambda lf: lf.with_row_index(),
+        lambda lf: lf.group_by("part").agg(pl.col("a").sum()),
+    ],
+)
+def test_scan_parquet_hive_partitioned(
+    in_memory_engine: pl.GPUEngine, hive_root: Path, query
+) -> None:
+    q = query(pl.scan_parquet(hive_root, hive_partitioning=True))
+    assert_gpu_result_equal(q, engine=in_memory_engine, check_row_order=False)
+
+
+@requires_hive_ir
+def test_scan_parquet_hive_partitioned_schema_override(
+    in_memory_engine: pl.GPUEngine, hive_root: Path
+) -> None:
+    q = pl.scan_parquet(
+        hive_root, hive_schema={"cat": pl.String, "part": pl.Int32}
+    ).filter(pl.col("part") > 1)
+    assert_gpu_result_equal(q, engine=in_memory_engine)
+
+
+@requires_hive_ir
+def test_scan_parquet_hive_partitioned_single_file(
+    in_memory_engine: pl.GPUEngine, tmp_path: Path
 ) -> None:
     (tmp_path / "part=1").mkdir()
     pl.DataFrame({"x": [1, 2, 3]}).write_parquet(tmp_path / "part=1" / "data.parquet")
     q = pl.scan_parquet(tmp_path, hive_schema={"part": pl.Int32})
-    assert_ir_translation_raises(q, engine, NotImplementedError)
+    assert_gpu_result_equal(q, engine=in_memory_engine)
+
+
+@requires_hive_ir
+def test_scan_parquet_hive_partitioned_shadowed_column(
+    in_memory_engine: pl.GPUEngine, tmp_path: Path
+) -> None:
+    # A file column of the same name as a hive key. Polars gives the hive
+    # value precedence and never asks us to read the file column.
+    for name, values in [("part=1", [100, 200]), ("part=2", [300, 400])]:
+        (tmp_path / name).mkdir()
+        pl.DataFrame({"a": [1, 2], "part": values}).write_parquet(
+            tmp_path / name / "data.parquet"
+        )
+    q = pl.scan_parquet(tmp_path, hive_partitioning=True)
+    assert_gpu_result_equal(q, engine=in_memory_engine, check_row_order=False)
+
+
+@requires_hive_ir
+def test_scan_parquet_hive_partitioned_null_value(
+    in_memory_engine: pl.GPUEngine, tmp_path: Path
+) -> None:
+    pl.DataFrame({"a": [1, 2, 3, 4], "part": ["u", "u", None, None]}).write_parquet(
+        tmp_path / "hive", partition_by=["part"]
+    )
+    q = pl.scan_parquet(tmp_path / "hive", hive_partitioning=True)
+    assert_gpu_result_equal(q, engine=in_memory_engine, check_row_order=False)
