@@ -38,6 +38,27 @@ if TYPE_CHECKING:
     from werkzeug import Request
 
 
+requires_hive_ir = pytest.mark.skipif(
+    POLARS_VERSION_LT_142,
+    reason="hive::HivePartitionedDf not exposed in the logical plan before 1.42",
+)
+
+
+@pytest.fixture
+def hive_root(tmp_path: Path) -> Path:
+    """A dataset partitioned by two keys, with differing rows per file."""
+    root = tmp_path / "hive"
+    pl.DataFrame(
+        {
+            "a": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "b": ["x", "y", "z", "w", "p", "q", "r", "s", "t"],
+            "part": [1, 1, 1, 2, 2, 3, 3, 4, 4],
+            "cat": ["u", "u", "u", "u", "u", "v", "v", "v", "v"],
+        }
+    ).write_parquet(root, partition_by=["cat", "part"])
+    return root
+
+
 NO_CHUNK_ENGINE = pl.GPUEngine(
     executor="in-memory", raise_on_fail=True, parquet_options={"chunked": False}
 )
@@ -475,6 +496,50 @@ def test_scan_include_file_path(
         assert_gpu_result_equal(q, engine=NO_CHUNK_ENGINE)
 
 
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        None,
+        pl.col("a") > 20,
+        pl.col("a") < 0,
+        pl.col("a") >= 10,
+    ],
+)
+def test_scan_parquet_include_file_path_with_predicate(
+    engine: pl.GPUEngine, tmp_path: Path, predicate
+) -> None:
+    # A pushed-down filter clears the reader's per-source row counts, so the
+    # paths have to be recovered from the source index instead.
+    for i, height in enumerate([3, 2, 4]):
+        pl.DataFrame({"a": [i * 10 + j for j in range(height)]}).write_parquet(
+            tmp_path / f"part-{i}.parquet"
+        )
+    q = pl.scan_parquet(tmp_path, include_file_paths="files")
+    if predicate is not None:
+        q = q.filter(predicate)
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@requires_hive_ir
+def test_scan_parquet_include_file_path_with_hive(
+    engine: pl.GPUEngine, hive_root: Path
+) -> None:
+    q = pl.scan_parquet(
+        hive_root, hive_partitioning=True, include_file_paths="files"
+    ).filter(pl.col("a") > 3)
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@requires_hive_ir
+def test_scan_parquet_include_file_path_with_hive_only_projection(
+    engine: pl.GPUEngine, hive_root: Path
+) -> None:
+    q = pl.scan_parquet(
+        hive_root, hive_partitioning=True, include_file_paths="files"
+    ).select("part", "files")
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
 @pytest.fixture(
     scope="module", params=["no_slice", "skip_to_end", "skip_partial", "partial"]
 )
@@ -891,27 +956,6 @@ def test_scan_parquet_is_between_literal_dtype_mismatch_22622(
     )
 
     assert_gpu_result_equal(q, engine=engine)
-
-
-requires_hive_ir = pytest.mark.skipif(
-    POLARS_VERSION_LT_142,
-    reason="hive::HivePartitionedDf not exposed in the logical plan before 1.42",
-)
-
-
-@pytest.fixture
-def hive_root(tmp_path: Path) -> Path:
-    """A dataset partitioned by two keys, with differing rows per file."""
-    root = tmp_path / "hive"
-    pl.DataFrame(
-        {
-            "a": [1, 2, 3, 4, 5, 6, 7, 8, 9],
-            "b": ["x", "y", "z", "w", "p", "q", "r", "s", "t"],
-            "part": [1, 1, 1, 2, 2, 3, 3, 4, 4],
-            "cat": ["u", "u", "u", "u", "u", "v", "v", "v", "v"],
-        }
-    ).write_parquet(root, partition_by=["cat", "part"])
-    return root
 
 
 @requires_hive_ir

@@ -899,28 +899,56 @@ class Scan(IR):
 
     @staticmethod
     def add_file_paths(
-        name: str, paths: list[str], rows_per_path: list[int], df: DataFrame
+        name: str,
+        paths: list[str],
+        df: DataFrame,
+        *,
+        rows_per_path: Sequence[int] | None = None,
+        source_index: plc.Column | None = None,
     ) -> DataFrame:
         """
         Add a Column of file paths to the DataFrame.
 
-        Each path is repeated according to the number of rows read from it.
+        Parameters
+        ----------
+        name
+            Name of the column to add.
+        paths
+            The paths read, in source order.
+        df
+            Frame to add the column to.
+        rows_per_path
+            Number of rows read from each path. Not valid once the reader has
+            applied a filter, which is why ``source_index`` exists.
+        source_index
+            Column giving the source each output row came from. Takes
+            precedence over ``rows_per_path`` when both are available.
         """
-        (filepaths,) = plc.filling.repeat(
-            plc.Table(
-                [
-                    plc.Column.from_arrow(
-                        pl.Series(values=map(str, paths)),
-                        stream=df.stream,
-                    )
-                ]
-            ),
-            plc.Column.from_arrow(
-                pl.Series(values=rows_per_path, dtype=pl.datatypes.Int32()),
+        path_table = plc.Table(
+            [
+                plc.Column.from_arrow(
+                    pl.Series(values=map(str, paths)),
+                    stream=df.stream,
+                )
+            ]
+        )
+        if source_index is not None:
+            (filepaths,) = plc.copying.gather(
+                path_table,
+                source_index,
+                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
                 stream=df.stream,
-            ),
-            stream=df.stream,
-        ).columns()
+            ).columns()
+        else:
+            assert rows_per_path is not None
+            (filepaths,) = plc.filling.repeat(
+                path_table,
+                plc.Column.from_arrow(
+                    pl.Series(values=rows_per_path, dtype=pl.datatypes.Int32()),
+                    stream=df.stream,
+                ),
+                stream=df.stream,
+            ).columns()
         dtype = DataType(pl.String())
         return df.with_columns(
             [Column(filepaths, name=name, dtype=dtype)], stream=df.stream
@@ -1151,8 +1179,8 @@ class Scan(IR):
                 df = Scan.add_file_paths(
                     include_file_paths,
                     seen_paths,
-                    [t.num_rows() for t in tables],
                     df,
+                    rows_per_path=[t.num_rows() for t in tables],
                 )
         elif typ == "parquet":
             if cached_parquet_info is not None:
@@ -1177,15 +1205,6 @@ class Scan(IR):
                 if with_columns is None or not hive_names
                 else [name for name in with_columns if name not in hive_names]
             )
-            # A uniform scan gives every row the same partition values, so the
-            # source of each row doesn't matter and we can skip reading it. An
-            # empty projection makes the reader return no rows at all, so there
-            # would be no index to read either.
-            prepend_source_index = (
-                hive_parts is not None
-                and not hive_parts.is_uniform
-                and file_columns != []
-            )
             rows_per_path: list[int] | None = None
             if hive_parts is not None and file_columns == []:
                 rows_per_path = cls._parquet_rows_per_path(
@@ -1208,6 +1227,16 @@ class Scan(IR):
                         if residual_expr is not None
                         else None
                     )
+            # The reader drops its per-source row counts once it applies a
+            # filter, so the source of each row has to be read instead. Hive
+            # columns need it too, unless every path shares the same partition
+            # values or the projection is empty, in which case the reader
+            # returns no rows and so no index either.
+            prepend_source_index = (
+                hive_parts is not None
+                and not hive_parts.is_uniform
+                and file_columns != []
+            ) or (include_file_paths is not None and filters is not None)
             builder = plc.io.parquet.ParquetReaderOptions.builder(source_info)
             if filters is not None and parquet_options.use_jit_filter:
                 builder.use_jit_filter(use_jit_filter=True)
@@ -1272,7 +1301,11 @@ class Scan(IR):
                 )
                 if include_file_paths is not None:
                     df = Scan.add_file_paths(  # pragma: no cover
-                        include_file_paths, paths, chunk.num_rows_per_source, df
+                        include_file_paths,
+                        paths,
+                        df,
+                        rows_per_path=rows_per_path or chunk.num_rows_per_source,
+                        source_index=source_index,
                     )
             else:
                 tbl_w_meta = plc.io.parquet.read_parquet(
@@ -1309,7 +1342,11 @@ class Scan(IR):
                 )
                 if include_file_paths is not None:
                     df = Scan.add_file_paths(
-                        include_file_paths, paths, tbl_w_meta.num_rows_per_source, df
+                        include_file_paths,
+                        paths,
+                        df,
+                        rows_per_path=rows_per_path or tbl_w_meta.num_rows_per_source,
+                        source_index=source_index,
                     )
             if hive_parts is not None:
                 if source_index is not None:
