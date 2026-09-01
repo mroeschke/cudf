@@ -107,6 +107,21 @@ def test_broadcast() -> None:
     )
 
 
+def test_repeat(partitions: HivePartitions) -> None:
+    stream = get_cuda_stream()
+    got = DataFrame(partitions.repeat([2, 0, 1], stream=stream), stream=stream)
+    assert_frame_equal(
+        got.to_polars(),
+        pl.DataFrame({"part": [1, 1, 3], "cat": ["u", "u", "v"]}),
+    )
+
+
+def test_repeat_empty(partitions: HivePartitions) -> None:
+    stream = get_cuda_stream()
+    got = DataFrame(partitions.repeat([0, 0, 0], stream=stream), stream=stream)
+    assert got.num_rows == 0
+
+
 def test_gather(partitions: HivePartitions) -> None:
     stream = get_cuda_stream()
     source_index = plc.Column.from_arrow(

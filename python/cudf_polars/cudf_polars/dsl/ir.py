@@ -957,6 +957,43 @@ class Scan(IR):
         return max(num_rows, 0)
 
     @staticmethod
+    @nvtx_annotate_cudf_polars(message="Scan._parquet_rows_per_path")
+    def _parquet_rows_per_path(
+        paths: list[str],
+        skip_rows: int,
+        n_rows: int,
+        cached_parquet_info: list[CachedParquetInfo] | None,
+    ) -> list[int]:
+        """
+        Rows each path contributes, from file metadata.
+
+        Only usable when no filter is pushed down, since the reader decides
+        which rows survive a filter. That is guaranteed for the callers of
+        this method, which read no columns from the files at all: polars only
+        pushes a predicate down alongside the file columns it references.
+        """
+        if cached_parquet_info is not None:
+            Scan._validate_cached_parquet_info(paths, cached_parquet_info)
+            totals = [info.file_metadata.num_rows for info in cached_parquet_info]
+        else:
+            totals = [
+                metadata.num_rows
+                for metadata in plc.io.parquet_metadata.read_parquet_footers(
+                    plc.io.SourceInfo(paths)
+                )
+            ]
+        available = max(sum(totals) - skip_rows, 0)
+        budget = available if n_rows == -1 else min(n_rows, available)
+        counts = []
+        for total in totals:
+            skipped = min(skip_rows, total)
+            skip_rows -= skipped
+            taken = min(total - skipped, budget)
+            budget -= taken
+            counts.append(taken)
+        return counts
+
+    @staticmethod
     def _pop_source_index(
         table: plc.Table, names: Sequence[str], *, prepended: bool
     ) -> tuple[plc.Column | None, plc.Table, list[str]]:
@@ -1141,8 +1178,19 @@ class Scan(IR):
                 else [name for name in with_columns if name not in hive_names]
             )
             # A uniform scan gives every row the same partition values, so the
-            # source of each row doesn't matter and we can skip reading it.
-            prepend_source_index = hive_parts is not None and not hive_parts.is_uniform
+            # source of each row doesn't matter and we can skip reading it. An
+            # empty projection makes the reader return no rows at all, so there
+            # would be no index to read either.
+            prepend_source_index = (
+                hive_parts is not None
+                and not hive_parts.is_uniform
+                and file_columns != []
+            )
+            rows_per_path: list[int] | None = None
+            if hive_parts is not None and file_columns == []:
+                rows_per_path = cls._parquet_rows_per_path(
+                    paths, skip_rows, n_rows, cached_parquet_info
+                )
 
             filters = None
             if predicate is not None and row_index is None:
@@ -1206,7 +1254,9 @@ class Scan(IR):
                 if not names:
                     table = plc.Table(
                         table.columns(),
-                        num_rows=cls._get_parquet_row_count_from_metadata(
+                        num_rows=sum(rows_per_path)
+                        if rows_per_path is not None
+                        else cls._get_parquet_row_count_from_metadata(
                             paths,
                             skip_rows,
                             n_rows,
@@ -1241,7 +1291,9 @@ class Scan(IR):
                 if not col_names:
                     table = plc.Table(
                         table.columns(),
-                        num_rows=cls._get_parquet_row_count_from_metadata(
+                        num_rows=sum(rows_per_path)
+                        if rows_per_path is not None
+                        else cls._get_parquet_row_count_from_metadata(
                             paths,
                             skip_rows,
                             n_rows,
@@ -1260,12 +1312,13 @@ class Scan(IR):
                         include_file_paths, paths, tbl_w_meta.num_rows_per_source, df
                     )
             if hive_parts is not None:
-                df = df.with_columns(
-                    hive_parts.broadcast(df.num_rows, stream=stream)
-                    if source_index is None
-                    else hive_parts.gather(source_index, stream=stream),
-                    stream=stream,
-                )
+                if source_index is not None:
+                    hive_columns = hive_parts.gather(source_index, stream=stream)
+                elif rows_per_path is not None:
+                    hive_columns = hive_parts.repeat(rows_per_path, stream=stream)
+                else:
+                    hive_columns = hive_parts.broadcast(df.num_rows, stream=stream)
+                df = df.with_columns(hive_columns, stream=stream)
                 df = df.select(
                     [
                         name

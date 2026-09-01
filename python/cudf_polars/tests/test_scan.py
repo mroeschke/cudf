@@ -212,6 +212,28 @@ def test_scan_do_evaluate_missing_prefetch_metadata() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "skip_rows,n_rows,expected",
+    [
+        (0, -1, [3, 2, 4]),
+        (0, 4, [3, 1, 0]),
+        (4, -1, [0, 1, 4]),
+        (3, 3, [0, 2, 1]),
+        (9, -1, [0, 0, 0]),
+        (20, 5, [0, 0, 0]),
+        (0, 0, [0, 0, 0]),
+    ],
+)
+def test_parquet_rows_per_path(tmp_path, skip_rows, n_rows, expected) -> None:
+    paths = []
+    for i, height in enumerate([3, 2, 4]):
+        path = tmp_path / f"part-{i}.parquet"
+        pl.DataFrame({"a": range(height)}).write_parquet(path)
+        paths.append(str(path))
+
+    assert Scan._parquet_rows_per_path(paths, skip_rows, n_rows, None) == expected
+
+
 def test_scan_unsupported_raises(engine: pl.GPUEngine, tmp_path):
     df = pl.DataFrame({"a": [1, 2, 3]})
 

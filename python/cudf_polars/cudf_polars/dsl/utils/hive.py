@@ -14,6 +14,8 @@ import pylibcudf as plc
 from cudf_polars.containers import Column, DataType
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from rmm.pylibrmm.stream import Stream
 
 __all__ = ["HivePartitions"]
@@ -138,6 +140,34 @@ class HivePartitions:
             )
         ]
 
+    def repeat(self, rows_per_path: Sequence[int], *, stream: Stream) -> list[Column]:
+        """
+        Materialize the partition values by repeating each path's values.
+
+        Used when no columns are read from the files at all, so there is no
+        source index to gather with and the row counts have to come from the
+        file metadata instead.
+
+        Parameters
+        ----------
+        rows_per_path
+            Number of output rows contributed by each path.
+        stream
+            CUDA stream used for device memory operations and kernel launches.
+
+        Returns
+        -------
+        One column per hive key, of length ``sum(rows_per_path)``.
+        """
+        repeated = plc.filling.repeat(
+            self._value_table(stream=stream),
+            plc.Column.from_arrow(
+                pl.Series(values=rows_per_path, dtype=pl.Int32()), stream=stream
+            ),
+            stream=stream,
+        )
+        return self._to_columns(repeated)
+
     def gather(self, source_index: plc.Column, *, stream: Stream) -> list[Column]:
         """
         Materialize the partition values by indexing them with a source index.
@@ -156,7 +186,17 @@ class HivePartitions:
         -------
         One column per hive key, aligned with ``source_index``.
         """
-        table = plc.Table(
+        return self._to_columns(
+            plc.copying.gather(
+                self._value_table(stream=stream),
+                source_index,
+                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                stream=stream,
+            )
+        )
+
+    def _value_table(self, *, stream: Stream) -> plc.Table:
+        return plc.Table(
             [
                 plc.Column.from_arrow(
                     pl.Series(values=value, dtype=dtype.polars_type), stream=stream
@@ -164,15 +204,11 @@ class HivePartitions:
                 for dtype, value in zip(self.dtypes, self.values, strict=True)
             ]
         )
-        gathered = plc.copying.gather(
-            table,
-            source_index,
-            plc.copying.OutOfBoundsPolicy.DONT_CHECK,
-            stream=stream,
-        )
+
+    def _to_columns(self, table: plc.Table) -> list[Column]:
         return [
             Column(column, name=name, dtype=dtype)
             for column, name, dtype in zip(
-                gathered.columns(), self.names, self.dtypes, strict=True
+                table.columns(), self.names, self.dtypes, strict=True
             )
         ]
