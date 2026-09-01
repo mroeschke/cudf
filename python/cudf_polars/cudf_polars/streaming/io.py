@@ -562,7 +562,8 @@ class SplitScan(IR):
                 include_file_paths,
                 predicate,
                 parquet_options,
-                cached_parquet_info,
+                hive_parts=None,
+                cached_parquet_info=cached_parquet_info,
                 context=context,
             )
 
@@ -669,7 +670,8 @@ class FusedScan(IR):
                 include_file_paths,
                 predicate,
                 parquet_options,
-                cached_parquet_info,
+                hive_parts=None,
+                cached_parquet_info=cached_parquet_info,
                 context=context,
             )
 

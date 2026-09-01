@@ -566,6 +566,7 @@ def test_scan_path_mismatch_raises() -> None:
             scan.include_file_paths,
             scan.predicate,
             scan.parquet_options,
+            scan.hive_parts,
             [],
             context=ctx,
         )
@@ -753,7 +754,7 @@ def test_cached_parquet_info_excluded_from_identity() -> None:
         None,
         None,
         base.parquet_options,
-        info,
+        cached_parquet_info=info,
     )
     assert scan_without == scan_with
     assert hash(scan_without) == hash(scan_with)

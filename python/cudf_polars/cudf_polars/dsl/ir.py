@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers.dataframe import NamedColumn
+    from cudf_polars.dsl.utils.hive import HivePartitions
     from cudf_polars.dsl.utils.io import CachedParquetInfo
     from cudf_polars.streaming.rank_aware_source import RankAwareSource
     from cudf_polars.typing import CSECache, ClosedInterval, Schema, Slice as Zlice
@@ -665,6 +666,7 @@ class Scan(IR):
     __slots__ = (
         "cached_parquet_info",
         "cloud_options",
+        "hive_parts",
         "include_file_paths",
         "n_rows",
         "parquet_options",
@@ -689,8 +691,9 @@ class Scan(IR):
         "include_file_paths",
         "predicate",
         "parquet_options",
+        "hive_parts",
     )
-    _n_non_child_args = 12
+    _n_non_child_args = 13
     typ: str
     """What type of file are we reading? Parquet, CSV, etc..."""
     reader_options: dict[str, Any]
@@ -713,6 +716,8 @@ class Scan(IR):
     """Mask to apply to the read dataframe."""
     parquet_options: ParquetOptions
     """Parquet-specific options."""
+    hive_parts: HivePartitions | None
+    """Hive partition values, one per path, or None if the scan is not hive-partitioned."""
     cached_parquet_info: list[CachedParquetInfo] | None
     """Cached parquet file metadata."""
 
@@ -733,6 +738,7 @@ class Scan(IR):
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
+        hive_parts: HivePartitions | None = None,
         cached_parquet_info: list[CachedParquetInfo] | None = None,
     ):
         self.schema = schema
@@ -758,13 +764,19 @@ class Scan(IR):
             include_file_paths,
             predicate,
             parquet_options,
+            hive_parts,
             cached_parquet_info,
         )
         self.children = ()
         self.parquet_options = parquet_options
+        self.hive_parts = hive_parts
         self.cached_parquet_info = cached_parquet_info
 
         Scan._validate_cached_parquet_info(self.paths, self.cached_parquet_info)
+        if hive_parts is not None and hive_parts.num_paths != len(paths):
+            raise AssertionError(
+                "Hive partition values do not match the number of paths"
+            )
 
         if self.typ not in ("csv", "parquet", "ndjson"):  # pragma: no cover
             # This line is unhittable ATM since IPC/Anonymous scan raise
@@ -882,6 +894,7 @@ class Scan(IR):
             self.include_file_paths,
             self.predicate,
             self.parquet_options,
+            self.hive_parts,
         )
 
     @staticmethod
@@ -944,6 +957,21 @@ class Scan(IR):
         return max(num_rows, 0)
 
     @staticmethod
+    def _pop_source_index(
+        table: plc.Table, names: Sequence[str], *, prepended: bool
+    ) -> tuple[plc.Column | None, plc.Table, list[str]]:
+        """
+        Split off the source index column the parquet reader prepends.
+
+        The reader synthesizes this column before applying any filter, so it
+        survives filter pushdown where per-source row counts do not.
+        """
+        if not prepended:
+            return None, table, list(names)
+        columns = table.columns()
+        return columns[0], plc.Table(columns[1:]), list(names[1:])
+
+    @staticmethod
     def _apply_parquet_projection(
         table: plc.Table, names: Sequence[str], with_columns: Sequence[str] | None
     ) -> tuple[plc.Table, list[str]]:
@@ -972,6 +1000,7 @@ class Scan(IR):
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
+        hive_parts: HivePartitions | None,
         cached_parquet_info: list[CachedParquetInfo] | None,
         *,
         context: IRExecutionContext,
@@ -1103,14 +1132,27 @@ class Scan(IR):
                 parquet_metadatas = None
                 source_info = plc.io.SourceInfo(paths)
 
+            hive_names = (
+                frozenset(hive_parts.names) if hive_parts is not None else frozenset()
+            )
+            file_columns = (
+                with_columns
+                if with_columns is None or not hive_names
+                else [name for name in with_columns if name not in hive_names]
+            )
+            # A uniform scan gives every row the same partition values, so the
+            # source of each row doesn't matter and we can skip reading it.
+            prepend_source_index = hive_parts is not None and not hive_parts.is_uniform
+
             filters = None
             if predicate is not None and row_index is None:
                 # Can't apply filters during read if we have a row index.
                 filters, residual_expr = to_parquet_filter(
                     _prepare_parquet_predicate(
-                        predicate.value, paths, schema, with_columns
+                        predicate.value, paths, schema, file_columns
                     ),
                     stream=stream,
+                    unreadable_columns=hive_names,
                 )
                 if filters is not None:
                     effective_predicate = (
@@ -1125,8 +1167,10 @@ class Scan(IR):
                 plc.TypeId.DECIMAL128
             ).build()
 
-            if with_columns is not None:
-                parquet_reader_options.set_column_names(with_columns)
+            if file_columns is not None:
+                parquet_reader_options.set_column_names(file_columns)
+            if prepend_source_index:
+                parquet_reader_options.enable_prepend_source_index_column(val=True)
             if filters is not None:
                 parquet_reader_options.set_filter(filters)
             if n_rows != -1:
@@ -1153,9 +1197,12 @@ class Scan(IR):
                         concatenated_columns[i] = plc.concatenate.concatenate(
                             [concatenated_columns[i], columns.pop()], stream=stream
                         )
-                table, names = cls._apply_parquet_projection(
-                    plc.Table(concatenated_columns), names, with_columns
+                source_index, table, names = cls._pop_source_index(
+                    plc.Table(concatenated_columns),
+                    names,
+                    prepended=prepend_source_index,
                 )
+                table, names = cls._apply_parquet_projection(table, names, file_columns)
                 if not names:
                     table = plc.Table(
                         table.columns(),
@@ -1185,8 +1232,11 @@ class Scan(IR):
                 )
                 # TODO: consider nested column names?
                 col_names = tbl_w_meta.column_names(include_children=False)
+                source_index, table, col_names = cls._pop_source_index(
+                    tbl_w_meta.tbl, col_names, prepended=prepend_source_index
+                )
                 table, col_names = cls._apply_parquet_projection(
-                    tbl_w_meta.tbl, col_names, with_columns
+                    table, col_names, file_columns
                 )
                 if not col_names:
                     table = plc.Table(
@@ -1209,6 +1259,20 @@ class Scan(IR):
                     df = Scan.add_file_paths(
                         include_file_paths, paths, tbl_w_meta.num_rows_per_source, df
                     )
+            if hive_parts is not None:
+                df = df.with_columns(
+                    hive_parts.broadcast(df.num_rows, stream=stream)
+                    if source_index is None
+                    else hive_parts.gather(source_index, stream=stream),
+                    stream=stream,
+                )
+                df = df.select(
+                    [
+                        name
+                        for name in schema
+                        if row_index is None or name != row_index[0]
+                    ]
+                )
             if filters is not None and effective_predicate is None:
                 return df
         elif typ == "ndjson":
