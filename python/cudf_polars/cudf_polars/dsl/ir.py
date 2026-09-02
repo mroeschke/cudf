@@ -914,8 +914,7 @@ class Scan(IR):
         df
             Frame to add the column to.
         rows_per_path
-            Number of rows read from each path. Not valid once the reader has
-            applied a filter, which is why ``source_index`` exists.
+            Number of rows read from each path.
         source_index
             Column giving the source each output row came from. Takes
             precedence over ``rows_per_path`` when both are available.
