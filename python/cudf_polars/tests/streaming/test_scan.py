@@ -42,7 +42,10 @@ from cudf_polars.streaming.io import (
 from cudf_polars.streaming.parallel import lower_ir_graph
 from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
-from cudf_polars.testing.engine_utils import SMALL_MAX_ROWS_PER_PARTITION
+from cudf_polars.testing.engine_utils import (
+    SMALL_MAX_ROWS_PER_PARTITION,
+    is_streaming_engine,
+)
 from cudf_polars.testing.io import make_partitioned_source
 from cudf_polars.utils.config import (
     ConfigOptions,
@@ -902,8 +905,10 @@ requires_hive_ir = pytest.mark.skipif(
 )
 
 
-def _hive_gpu_engine() -> pl.GPUEngine:
-    return pl.GPUEngine(raise_on_fail=True, executor="streaming")
+def _require_streaming_engine(engine: pl.GPUEngine) -> None:
+    """Skip a test that inspects streaming-only IR on the in-memory engine."""
+    if not is_streaming_engine(engine):
+        pytest.skip("SplitScan/FusedScan are only built for streaming engines")
 
 
 @pytest.fixture
@@ -953,9 +958,12 @@ def test_hive_partitioned_streaming_scan(
 
 
 @requires_hive_ir
-def test_hive_partitioned_split_scan_slices_partitions(hive_root: Path) -> None:
+def test_hive_partitioned_split_scan_slices_partitions(
+    hive_root: Path, engine: pl.GPUEngine
+) -> None:
+    _require_streaming_engine(engine)
     q = pl.scan_parquet(hive_root, hive_partitioning=True)
-    scan = cast("Scan", Translator(q._ldf.visit(), _hive_gpu_engine()).translate_ir())
+    scan = cast("Scan", Translator(q._ldf.visit(), engine).translate_ir())
     assert scan.hive_parts is not None
 
     streaming = StreamingScan.for_split_files(
@@ -984,9 +992,12 @@ def test_hive_partitioned_split_scan_slices_partitions(hive_root: Path) -> None:
 
 
 @requires_hive_ir
-def test_hive_partitioned_fused_scan_slices_partitions(hive_root: Path) -> None:
+def test_hive_partitioned_fused_scan_slices_partitions(
+    hive_root: Path, engine: pl.GPUEngine
+) -> None:
+    _require_streaming_engine(engine)
     q = pl.scan_parquet(hive_root, hive_partitioning=True)
-    scan = cast("Scan", Translator(q._ldf.visit(), _hive_gpu_engine()).translate_ir())
+    scan = cast("Scan", Translator(q._ldf.visit(), engine).translate_ir())
 
     streaming = StreamingScan.for_fused_files(
         scan,
@@ -1004,11 +1015,14 @@ def test_hive_partitioned_fused_scan_slices_partitions(hive_root: Path) -> None:
 
 
 @requires_hive_ir
-def test_hive_partitioned_scan_skips_hybrid_scan(hive_root: Path) -> None:
+def test_hive_partitioned_scan_skips_hybrid_scan(
+    hive_root: Path, engine: pl.GPUEngine
+) -> None:
     # The hybrid reader cannot keep hive columns out of what it asks the file
     # for, so a hive scan must fall back to the regular reader.
+    _require_streaming_engine(engine)
     q = pl.scan_parquet(hive_root, hive_partitioning=True).filter(pl.col("x") > 400)
-    scan = cast("Scan", Translator(q._ldf.visit(), _hive_gpu_engine()).translate_ir())
+    scan = cast("Scan", Translator(q._ldf.visit(), engine).translate_ir())
     assert scan.hive_parts is not None
     assert scan.predicate is not None
 
