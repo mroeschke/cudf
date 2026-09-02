@@ -32,6 +32,7 @@ from typing import (
     Any,
     ClassVar,
     ParamSpec,
+    TypeAlias,
     TypeVar,
     assert_never,
     overload,
@@ -2544,65 +2545,64 @@ def _strip_predicate_casts(node: expr.Expr) -> expr.Expr:
     return node.reconstruct([_strip_predicate_casts(child) for child in node.children])
 
 
-def _add_cast(
-    target: DataType,
-    side: expr.ColRef,
-    left_casts: dict[str, DataType],
-    right_casts: dict[str, DataType],
-) -> None:
-    (col,) = side.children
-    assert isinstance(col, expr.Col)
-    casts = (
-        left_casts if side.table_ref == plc_expr.TableReference.LEFT else right_casts
-    )
-    casts[col.name] = target
+_ColumnKey: TypeAlias = tuple[plc_expr.TableReference, str]
 
 
-def _align_decimal_binop_types(
-    left_expr: expr.ColRef,
-    right_expr: expr.ColRef,
-    left_casts: dict[str, DataType],
-    right_casts: dict[str, DataType],
-) -> None:
-    left_type, right_type = left_expr.dtype, right_expr.dtype
-    if not (
-        (
-            plc.traits.is_fixed_point(left_type.plc_type)
-            and plc.traits.is_floating_point(right_type.plc_type)
-        )
-        or (
-            plc.traits.is_fixed_point(right_type.plc_type)
-            and plc.traits.is_floating_point(left_type.plc_type)
-        )
-    ):
-        return
-
-    is_decimal_left = plc.traits.is_fixed_point(left_type.plc_type)
-    decimal_expr, float_expr = (
-        (left_expr, right_expr) if is_decimal_left else (right_expr, left_expr)
-    )
-    _add_cast(decimal_expr.dtype, float_expr, left_casts, right_casts)
+def _colref_comparisons(
+    node: expr.Expr,
+) -> Iterator[tuple[expr.ColRef, expr.ColRef]]:
+    if isinstance(node, expr.BinOp) and node.op in _BINOPS:
+        left_expr, right_expr = node.children
+        if isinstance(left_expr, expr.ColRef) and isinstance(right_expr, expr.ColRef):
+            yield (left_expr, right_expr)
+    for child in node.children:
+        yield from _colref_comparisons(child)
 
 
 def _collect_decimal_binop_casts(
     predicate: expr.Expr,
 ) -> tuple[dict[str, DataType], dict[str, DataType]]:
+    comparisons: list[tuple[_ColumnKey, _ColumnKey]] = []
+    dtypes: dict[_ColumnKey, DataType] = {}
+    for left_expr, right_expr in _colref_comparisons(predicate):
+        if not all(
+            plc.traits.is_fixed_point(side.dtype.plc_type)
+            or plc.traits.is_floating_point(side.dtype.plc_type)
+            for side in (left_expr, right_expr)
+        ):
+            continue
+        (left_col,) = left_expr.children
+        (right_col,) = right_expr.children
+        assert isinstance(left_col, expr.Col)
+        assert isinstance(right_col, expr.Col)
+        left_key = (left_expr.table_ref, left_col.name)
+        right_key = (right_expr.table_ref, right_col.name)
+        dtypes[left_key] = left_expr.dtype
+        dtypes[right_key] = right_expr.dtype
+        comparisons.append((left_key, right_key))
+
+    # Polars' supertype of a decimal and a float is Float64, see
+    # crates/polars-core/src/utils/supertype.rs.
+    target = DataType(pl.Float64())
+    realigned: set[_ColumnKey] = set()
+    previous = -1
+    while len(realigned) != previous:
+        previous = len(realigned)
+        for left_key, right_key in comparisons:
+            if plc.traits.is_fixed_point(
+                dtypes[left_key].plc_type
+            ) == plc.traits.is_fixed_point(dtypes[right_key].plc_type):
+                continue
+            for key in (left_key, right_key):
+                if dtypes[key] != target:
+                    dtypes[key] = target
+                    realigned.add(key)
+
     left_casts: dict[str, DataType] = {}
     right_casts: dict[str, DataType] = {}
-
-    def _walk(node: expr.Expr) -> None:
-        if isinstance(node, expr.BinOp) and node.op in _BINOPS:
-            left_expr, right_expr = node.children
-            if isinstance(left_expr, expr.ColRef) and isinstance(
-                right_expr, expr.ColRef
-            ):
-                _align_decimal_binop_types(
-                    left_expr, right_expr, left_casts, right_casts
-                )
-        for child in node.children:
-            _walk(child)
-
-    _walk(predicate)
+    for table_ref, name in realigned:
+        casts = left_casts if table_ref == plc_expr.TableReference.LEFT else right_casts
+        casts[name] = target
     return left_casts, right_casts
 
 
