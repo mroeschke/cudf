@@ -773,10 +773,6 @@ class Scan(IR):
         self.cached_parquet_info = cached_parquet_info
 
         Scan._validate_cached_parquet_info(self.paths, self.cached_parquet_info)
-        if hive_parts is not None and hive_parts.num_paths != len(paths):
-            raise AssertionError(
-                "Hive partition values do not match the number of paths"
-            )
 
         if self.typ not in ("csv", "parquet", "ndjson"):  # pragma: no cover
             # This line is unhittable ATM since IPC/Anonymous scan raise
