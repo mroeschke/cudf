@@ -973,13 +973,13 @@ def test_hive_partitioned_split_scan_slices_partitions(hive_root: Path) -> None:
         assert split.hive_parts.num_paths == 1
         assert split.hive_parts.is_uniform
         hive_parts.append(split.hive_parts)
-    assert [parts.values for parts in hive_parts] == [
-        ((0,),),
-        ((0,),),
-        ((1,),),
-        ((1,),),
-        ((2,),),
-        ((2,),),
+    assert [parts.df.rows() for parts in hive_parts] == [
+        [(0,)],
+        [(0,)],
+        [(1,)],
+        [(1,)],
+        [(2,)],
+        [(2,)],
     ]
 
 
@@ -1000,7 +1000,7 @@ def test_hive_partitioned_fused_scan_slices_partitions(hive_root: Path) -> None:
     for fused in streaming.scans:
         assert fused.hive_parts is not None
         hive_parts.append(fused.hive_parts)
-    assert [parts.values for parts in hive_parts] == [((0, 1),), ((2,),)]
+    assert [parts.df.rows() for parts in hive_parts] == [[(0,), (1,)], [(2,)]]
 
 
 @requires_hive_ir
