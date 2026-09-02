@@ -233,28 +233,6 @@ def test_scan_do_evaluate_missing_prefetch_metadata() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "skip_rows,n_rows,expected",
-    [
-        (0, -1, [3, 2, 4]),
-        (0, 4, [3, 1, 0]),
-        (4, -1, [0, 1, 4]),
-        (3, 3, [0, 2, 1]),
-        (9, -1, [0, 0, 0]),
-        (20, 5, [0, 0, 0]),
-        (0, 0, [0, 0, 0]),
-    ],
-)
-def test_parquet_rows_per_path(tmp_path, skip_rows, n_rows, expected) -> None:
-    paths = []
-    for i, height in enumerate([3, 2, 4]):
-        path = tmp_path / f"part-{i}.parquet"
-        pl.DataFrame({"a": range(height)}).write_parquet(path)
-        paths.append(str(path))
-
-    assert Scan._parquet_rows_per_path(paths, skip_rows, n_rows, None) == expected
-
-
 def test_scan_unsupported_raises(engine: pl.GPUEngine, tmp_path):
     df = pl.DataFrame({"a": [1, 2, 3]})
 
@@ -1080,6 +1058,28 @@ def test_scan_parquet_hive_partitioned_dtypes(
     )
     q = query(pl.scan_parquet(root, hive_schema={"part": dtype}))
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@requires_hive_ir
+@pytest.mark.parametrize(
+    "offset,length",
+    [(0, None), (0, 4), (4, None), (3, 3), (9, None), (20, 5), (0, 0)],
+)
+def test_scan_parquet_hive_only_projection_sliced(
+    engine: pl.GPUEngine, tmp_path: Path, offset: int, length: int | None
+) -> None:
+    # Projecting only a hive column reads nothing from the files, so each
+    # path's row count has to come from its metadata. Paths of differing
+    # heights mean a mis-split slice shows up as wrong partition values.
+    root = tmp_path / "hive"
+    for part, height in enumerate([3, 2, 4]):
+        (root / f"part={part}").mkdir(parents=True)
+        pl.DataFrame({"a": range(height)}).write_parquet(
+            root / f"part={part}" / "data.parquet"
+        )
+    q = pl.scan_parquet(root, hive_schema={"part": pl.Int64}).select("part")
+    q = q.slice(offset) if length is None else q.slice(offset, length)
+    assert_gpu_result_equal(q, engine=engine)
 
 
 @requires_hive_ir
