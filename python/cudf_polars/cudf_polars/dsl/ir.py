@@ -1025,13 +1025,16 @@ class Scan(IR):
             ]
         available = max(sum(totals) - skip_rows, 0)
         budget = available if n_rows == -1 else min(n_rows, available)
-        counts = []
-        for total in totals:
+        # Paths beyond the budget contribute nothing, so the remaining zeros
+        # stand whether they were never reached or skipped over entirely.
+        counts = [0] * len(totals)
+        for i, total in enumerate(totals):
+            if budget == 0:
+                break
             skipped = min(skip_rows, total)
             skip_rows -= skipped
-            taken = min(total - skipped, budget)
-            budget -= taken
-            counts.append(taken)
+            counts[i] = min(total - skipped, budget)
+            budget -= counts[i]
         return counts
 
     @staticmethod
