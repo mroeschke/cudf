@@ -2551,6 +2551,21 @@ _ColumnKey: TypeAlias = tuple[plc_expr.TableReference, str]
 def _colref_comparisons(
     node: expr.Expr,
 ) -> Iterator[tuple[expr.ColRef, expr.ColRef]]:
+    """
+    Yield the column-to-column comparisons in a predicate.
+
+    Parameters
+    ----------
+    node
+        Predicate expression to traverse.
+
+    Yields
+    ------
+    tuple[expr.ColRef, expr.ColRef]
+        Left and right operands of each comparison whose operands are both
+        column references. Comparisons against literals or computed
+        subexpressions are skipped.
+    """
     if isinstance(node, expr.BinOp) and node.op in _BINOPS:
         left_expr, right_expr = node.children
         if isinstance(left_expr, expr.ColRef) and isinstance(right_expr, expr.ColRef):
@@ -2562,6 +2577,31 @@ def _colref_comparisons(
 def _collect_decimal_binop_casts(
     predicate: expr.Expr,
 ) -> tuple[dict[str, DataType], dict[str, DataType]]:
+    """
+    Determine the casts that align decimal and float join operands.
+
+    libcudf's AST requires both operands of a comparison to share a type id,
+    and polars' supertype for a decimal and a float is Float64 (see
+    ``crates/polars-core/src/utils/supertype.rs``), so any column compared
+    against one of the other kind is cast to Float64.
+
+    Parameters
+    ----------
+    predicate
+        Predicate expression of the conditional join, with column references
+        already inserted.
+
+    Returns
+    -------
+    tuple[dict[str, DataType], dict[str, DataType]]
+        Column name to target dtype for the left and right join operands that
+        need casting.
+
+    Notes
+    -----
+    Decimal values beyond 2**53 cannot round-trip through Float64. Polars
+    accepts that loss by making Float64 the supertype.
+    """
     comparisons: list[tuple[_ColumnKey, _ColumnKey]] = []
     dtypes: dict[_ColumnKey, DataType] = {}
     for left_expr, right_expr in _colref_comparisons(predicate):
@@ -2581,8 +2621,6 @@ def _collect_decimal_binop_casts(
         dtypes[right_key] = right_expr.dtype
         comparisons.append((left_key, right_key))
 
-    # Polars' supertype of a decimal and a float is Float64, see
-    # crates/polars-core/src/utils/supertype.rs.
     target = DataType(pl.Float64())
     realigned: set[_ColumnKey] = set()
     previous = -1
@@ -2610,14 +2648,13 @@ def _apply_casts(df: DataFrame, casts: dict[str, DataType]) -> DataFrame:
     if not casts:
         return df
 
-    columns = []
+    columns: list[Column] = []
     for col in df.columns:
         target = casts.get(col.name)
         if target is None:
-            columns.append(Column(col.obj, dtype=col.dtype, name=col.name))
+            columns.append(col.copy())
         else:
-            casted = col.astype(target, stream=df.stream)
-            columns.append(Column(casted.obj, dtype=casted.dtype, name=col.name))
+            columns.append(col.astype(target, stream=df.stream))
     return DataFrame(columns, stream=df.stream)
 
 
