@@ -994,6 +994,24 @@ class Scan(IR):
         which rows survive a filter. That is guaranteed for the callers of
         this method, which read no columns from the files at all: polars only
         pushes a predicate down alongside the file columns it references.
+
+        Parameters
+        ----------
+        paths
+            The paths to read, in source order.
+        skip_rows
+            Number of leading rows to skip, counted across the paths as a
+            whole rather than per path.
+        n_rows
+            Maximum number of rows to read once ``skip_rows`` have been
+            skipped, or ``-1`` for no limit.
+        cached_parquet_info
+            Prefetched file metadata. The footers are read when this is
+            ``None``.
+
+        Returns
+        -------
+        Rows contributed by each path, in source order.
         """
         if cached_parquet_info is not None:
             Scan._validate_cached_parquet_info(paths, cached_parquet_info)
@@ -1025,6 +1043,21 @@ class Scan(IR):
 
         The reader synthesizes this column before applying any filter, so it
         survives filter pushdown where per-source row counts do not.
+
+        Parameters
+        ----------
+        table
+            Table as returned by the reader.
+        names
+            Column names of ``table``.
+        prepended
+            Whether the reader was asked to prepend the source index. The
+            table and names are passed through untouched when it was not.
+
+        Returns
+        -------
+        The source index column, or ``None`` if it was not requested, along
+        with the remaining table and its column names.
         """
         if not prepended:
             return None, table, list(names)
