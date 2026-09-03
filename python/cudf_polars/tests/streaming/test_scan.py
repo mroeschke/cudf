@@ -905,12 +905,6 @@ requires_hive_ir = pytest.mark.skipif(
 )
 
 
-def _require_streaming_engine(engine: pl.GPUEngine) -> None:
-    """Skip a test that inspects streaming-only IR on the in-memory engine."""
-    if not is_streaming_engine(engine):
-        pytest.skip("SplitScan/FusedScan are only built for streaming engines")
-
-
 @pytest.fixture
 def hive_root(tmp_path: Path) -> Path:
     """Hive dataset with several row groups per file, to allow file splitting."""
@@ -961,7 +955,8 @@ def test_hive_partitioned_streaming_scan(
 def test_hive_partitioned_split_scan_slices_partitions(
     hive_root: Path, engine: pl.GPUEngine
 ) -> None:
-    _require_streaming_engine(engine)
+    if not is_streaming_engine(engine):
+        pytest.skip("SplitScan/FusedScan are only built for streaming engines")
     q = pl.scan_parquet(hive_root, hive_partitioning=True)
     scan = cast("Scan", Translator(q._ldf.visit(), engine).translate_ir())
     assert scan.hive_parts is not None
@@ -995,7 +990,8 @@ def test_hive_partitioned_split_scan_slices_partitions(
 def test_hive_partitioned_fused_scan_slices_partitions(
     hive_root: Path, engine: pl.GPUEngine
 ) -> None:
-    _require_streaming_engine(engine)
+    if not is_streaming_engine(engine):
+        pytest.skip("SplitScan/FusedScan are only built for streaming engines")
     q = pl.scan_parquet(hive_root, hive_partitioning=True)
     scan = cast("Scan", Translator(q._ldf.visit(), engine).translate_ir())
 
@@ -1020,7 +1016,8 @@ def test_hive_partitioned_scan_skips_hybrid_scan(
 ) -> None:
     # The hybrid reader cannot keep hive columns out of what it asks the file
     # for, so a hive scan must fall back to the regular reader.
-    _require_streaming_engine(engine)
+    if not is_streaming_engine(engine):
+        pytest.skip("SplitScan/FusedScan are only built for streaming engines")
     q = pl.scan_parquet(hive_root, hive_partitioning=True).filter(pl.col("x") > 400)
     scan = cast("Scan", Translator(q._ldf.visit(), engine).translate_ir())
     assert scan.hive_parts is not None
