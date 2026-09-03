@@ -995,8 +995,6 @@ def test_scan_parquet_hive_partitioned_single_file(
 def test_scan_parquet_hive_partitioned_shadowed_column(
     engine: pl.GPUEngine, tmp_path: Path
 ) -> None:
-    # A file column of the same name as a hive key. Polars gives the hive
-    # value precedence and never asks us to read the file column.
     for name, values in [("part=1", [100, 200]), ("part=2", [300, 400])]:
         (tmp_path / name).mkdir()
         pl.DataFrame({"a": [1, 2], "part": values}).write_parquet(
