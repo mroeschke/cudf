@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from cudf_polars.containers import DataType
     from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import CachedParquetInfo, IRExecutionContext
-    from cudf_polars.dsl.utils.hive import HivePartitions
+    from cudf_polars.dsl.utils.per_path import PerPathValues
     from cudf_polars.streaming.base import (
         DataSourceInfo,
         SerializedDataSourceInfo,
@@ -211,7 +211,7 @@ def hybrid_scan_eligible(
     row_index: tuple[str, int] | None,
     include_file_paths: str | None,
     predicate: NamedExpr | None,
-    hive_parts: HivePartitions | None,
+    hive_parts: PerPathValues | None,
 ) -> bool:
     """Whether a parquet split is eligible for the HybridScanReader path."""
     return (
@@ -390,7 +390,7 @@ class SplitScan(IR):
     """Total number of splits."""
     parquet_options: ParquetOptions
     """Parquet-specific options."""
-    hive_parts: HivePartitions | None
+    hive_parts: PerPathValues | None
     """Hive partition values for this split's path."""
     cached_parquet_info: list[CachedParquetInfo] | None
 
@@ -402,7 +402,7 @@ class SplitScan(IR):
         split_index: int,
         total_splits: int,
         parquet_options: ParquetOptions,
-        hive_parts: HivePartitions | None = None,
+        hive_parts: PerPathValues | None = None,
         cached_parquet_info: list[CachedParquetInfo] | None = None,
     ):
         self.schema = schema
@@ -465,7 +465,7 @@ class SplitScan(IR):
         include_file_paths: str | None,
         predicate: NamedExpr | None,
         parquet_options: ParquetOptions,
-        hive_parts: HivePartitions | None,
+        hive_parts: PerPathValues | None,
         cached_parquet_info: list[CachedParquetInfo] | None,
         *,
         context: IRExecutionContext,
@@ -618,7 +618,7 @@ class FusedScan(IR):
     """File paths assigned to this task."""
     parquet_options: ParquetOptions
     """Parquet-specific options."""
-    hive_parts: HivePartitions | None
+    hive_parts: PerPathValues | None
     """Hive partition values for this task's paths."""
     cached_parquet_info: list[CachedParquetInfo] | None
     """Cached parquet metadata."""
@@ -629,7 +629,7 @@ class FusedScan(IR):
         base_scan: Scan,
         paths: list[str],
         parquet_options: ParquetOptions,
-        hive_parts: HivePartitions | None = None,
+        hive_parts: PerPathValues | None = None,
         cached_parquet_info: list[CachedParquetInfo] | None = None,
     ):
         self.schema = schema
@@ -680,7 +680,7 @@ class FusedScan(IR):
         include_file_paths: str | None,
         predicate: NamedExpr | None,
         parquet_options: ParquetOptions,
-        hive_parts: HivePartitions | None,
+        hive_parts: PerPathValues | None,
         cached_parquet_info: list[CachedParquetInfo] | None,
         *,
         context: IRExecutionContext,

@@ -51,6 +51,7 @@ from cudf_polars.dsl.nodebase import Node
 from cudf_polars.dsl.to_ast import _DECIMAL_IDS, to_ast, to_parquet_filter
 from cudf_polars.dsl.tracing import log_do_evaluate, nvtx_annotate_cudf_polars
 from cudf_polars.dsl.utils.naming import unique_names
+from cudf_polars.dsl.utils.per_path import PerPathValues
 from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.dsl.utils.windows import (
     offsets_to_windows,
@@ -84,7 +85,6 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers.dataframe import NamedColumn
-    from cudf_polars.dsl.utils.hive import HivePartitions
     from cudf_polars.dsl.utils.io import CachedParquetInfo
     from cudf_polars.streaming.rank_aware_source import RankAwareSource
     from cudf_polars.typing import CSECache, ClosedInterval, Schema, Slice as Zlice
@@ -716,7 +716,7 @@ class Scan(IR):
     """Mask to apply to the read dataframe."""
     parquet_options: ParquetOptions
     """Parquet-specific options."""
-    hive_parts: HivePartitions | None
+    hive_parts: PerPathValues | None
     """Hive partition values, one per path, or None if the scan is not hive-partitioned."""
     cached_parquet_info: list[CachedParquetInfo] | None
     """Cached parquet file metadata."""
@@ -738,7 +738,7 @@ class Scan(IR):
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
-        hive_parts: HivePartitions | None = None,
+        hive_parts: PerPathValues | None = None,
         cached_parquet_info: list[CachedParquetInfo] | None = None,
     ):
         self.schema = schema
@@ -918,36 +918,22 @@ class Scan(IR):
         source_index
             Column giving the source each output row came from. Takes
             precedence over ``rows_per_path`` when both are available.
+
+        Returns
+        -------
+        ``df`` with the file path column appended.
         """
-        path_table = plc.Table(
-            [
-                plc.Column.from_arrow(
-                    pl.Series(values=map(str, paths)),
-                    stream=df.stream,
-                )
-            ]
+        per_path = PerPathValues(
+            pl.DataFrame(
+                {name: [str(path) for path in paths]}, schema={name: pl.String()}
+            )
         )
         if source_index is not None:
-            (filepaths,) = plc.copying.gather(
-                path_table,
-                source_index,
-                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
-                stream=df.stream,
-            ).columns()
+            columns = per_path.gather(source_index, stream=df.stream)
         else:
             assert rows_per_path is not None
-            (filepaths,) = plc.filling.repeat(
-                path_table,
-                plc.Column.from_arrow(
-                    pl.Series(values=rows_per_path, dtype=pl.datatypes.Int32()),
-                    stream=df.stream,
-                ),
-                stream=df.stream,
-            ).columns()
-        dtype = DataType(pl.String())
-        return df.with_columns(
-            [Column(filepaths, name=name, dtype=dtype)], stream=df.stream
-        )
+            columns = per_path.repeat(rows_per_path, stream=df.stream)
+        return df.with_columns(columns, stream=df.stream)
 
     @staticmethod
     @nvtx_annotate_cudf_polars(message="Scan._get_parquet_row_count_from_metadata")
@@ -1096,7 +1082,7 @@ class Scan(IR):
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
-        hive_parts: HivePartitions | None,
+        hive_parts: PerPathValues | None,
         cached_parquet_info: list[CachedParquetInfo] | None,
         *,
         context: IRExecutionContext,

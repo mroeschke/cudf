@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Hive partition values attached to a file scan."""
+"""Values attached to each path of a file scan."""
 
 from __future__ import annotations
 
@@ -19,19 +19,16 @@ if TYPE_CHECKING:
 
     from rmm.pylibrmm.stream import Stream
 
-__all__ = ["HivePartitions"]
+__all__ = ["PerPathValues"]
 
 
 @dataclasses.dataclass(frozen=True, eq=False, repr=False)
-class HivePartitions:
+class PerPathValues:
     """
-    Hive partition values, one row per file in a scan.
+    Values that vary per path in a file scan, one row per path.
 
-    Polars provides a predicate-filtered DataFrame of partition values
-    for each parquet file.
-
-    For example, a dataset written with ``partition_by=["cat", "part"]`` hands
-    over a frame like::
+    For example, a hive-partitioned scan of a dataset written with
+    ``partition_by=["cat", "part"]`` supplies four paths and this frame::
 
         shape: (4, 2)
         ┌──────┬─────┐
@@ -52,13 +49,13 @@ class HivePartitions:
     Parameters
     ----------
     df
-        Partition values.
+        One row per path, one column per value to materialize.
     """
 
     df: pl.DataFrame
 
     @classmethod
-    def from_polars(cls, df: pl.DataFrame) -> HivePartitions | None:
+    def from_polars(cls, df: pl.DataFrame) -> PerPathValues | None:
         """
         Build from the ``hive_parts`` dataframe of a polars ``Scan`` node.
 
@@ -78,25 +75,25 @@ class HivePartitions:
 
     @functools.cached_property
     def names(self) -> tuple[str, ...]:
-        """Names of the hive columns."""
+        """Names of the columns to materialize."""
         return tuple(self.df.columns)
 
     @functools.cached_property
     def dtypes(self) -> tuple[DataType, ...]:
-        """Datatype of each hive column."""
+        """Datatype of each column."""
         return tuple(DataType(dtype) for dtype in self.df.dtypes)
 
     @property
     def num_paths(self) -> int:
-        """Number of paths these partition values describe."""
+        """Number of paths these values describe."""
         return self.df.height
 
     @functools.cached_property
     def is_uniform(self) -> bool:
-        """Whether every path shares the same partition values."""
+        """Whether every path shares the same values."""
         return all(series.n_unique() <= 1 for series in self.df.iter_columns())
 
-    def slice(self, start: int, stop: int) -> HivePartitions:
+    def slice(self, start: int, stop: int) -> PerPathValues:
         """
         Restrict to the paths in ``range(start, stop)``.
 
@@ -109,16 +106,16 @@ class HivePartitions:
 
         Returns
         -------
-        Partition values for the selected paths.
+        Values for the selected paths.
         """
         return type(self)(self.df.slice(start, stop - start))
 
     def broadcast(self, num_rows: int, *, stream: Stream) -> list[Column]:
         """
-        Materialize the partition values as columns of ``num_rows`` equal rows.
+        Materialize the values as columns of ``num_rows`` equal rows.
 
         Only valid when :attr:`is_uniform` holds, since every output row is
-        given the partition values of the first path.
+        given the values of the first path.
 
         Parameters
         ----------
@@ -129,7 +126,7 @@ class HivePartitions:
 
         Returns
         -------
-        One column per hive key.
+        One column per value.
         """
         return self._to_columns(
             plc.filling.repeat(
@@ -141,11 +138,10 @@ class HivePartitions:
 
     def repeat(self, rows_per_path: Sequence[int], *, stream: Stream) -> list[Column]:
         """
-        Materialize the partition values by repeating each path's values.
+        Materialize the values by repeating each path's row.
 
-        Used when no columns are read from the files at all, so there is no
-        source index to gather with and the row counts have to come from the
-        file metadata instead.
+        Used when there is no source index to gather with, so the number of
+        rows each path contributes has to be known up front.
 
         Parameters
         ----------
@@ -156,7 +152,7 @@ class HivePartitions:
 
         Returns
         -------
-        One column per hive key, of length ``sum(rows_per_path)``.
+        One column per value, of length ``sum(rows_per_path)``.
         """
         return self._to_columns(
             plc.filling.repeat(
@@ -170,7 +166,7 @@ class HivePartitions:
 
     def gather(self, source_index: plc.Column, *, stream: Stream) -> list[Column]:
         """
-        Materialize the partition values by indexing them with a source index.
+        Materialize the values by indexing them with a source index.
 
         Parameters
         ----------
@@ -184,7 +180,7 @@ class HivePartitions:
 
         Returns
         -------
-        One column per hive key, aligned with ``source_index``.
+        One column per value, aligned with ``source_index``.
         """
         return self._to_columns(
             plc.copying.gather(
@@ -204,19 +200,19 @@ class HivePartitions:
         ]
 
     def __repr__(self) -> str:
-        """Representation showing the partition values."""
+        """Representation showing the values."""
         return f"{type(self).__name__}(df={self.df!r})"
 
     def __hash__(self) -> int:
-        """Hash of the schema and of every partition value."""
+        """Hash of the schema and of every value."""
         return hash(
             (tuple(self.df.schema.items()), tuple(self.df.hash_rows().to_list()))
         )
 
     def __eq__(self, other: Any) -> bool:
-        """Whether two sets of partition values agree, dtypes included."""
+        """Whether two sets of values agree, dtypes included."""
         return (
-            isinstance(other, HivePartitions)
+            isinstance(other, PerPathValues)
             and self.df.schema == other.df.schema
             and self.df.equals(other.df)
         )
