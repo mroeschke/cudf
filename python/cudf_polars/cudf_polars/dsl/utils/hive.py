@@ -27,14 +27,11 @@ class HivePartitions:
     """
     Hive partition values, one row per file in a scan.
 
-    Polars parses hive keys out of the file paths and prunes the file list
-    using any predicate it can evaluate against them. What reaches us is the
-    surviving file list plus the partition values for those files, which are
-    not stored in the parquet files themselves and so must be materialized
-    onto the rows we read.
+    Polars provides a predicate-filtered DataFrame of partition values
+    for each parquet file.
 
-    Scanning a dataset written with ``partition_by=["cat", "part"]`` hands
-    over a frame like this for the four surviving paths::
+    For example, a dataset written with ``partition_by=["cat", "part"]`` hands
+    over a frame like::
 
         shape: (4, 2)
         ┌──────┬─────┐
@@ -48,15 +45,14 @@ class HivePartitions:
         │ 4    ┆ v   │
         └──────┴─────┘
 
-    Row ``i`` holds the values for path ``i``, so the frame is as tall as the
-    file list. The columns need not be in the order the keys appear in the
-    paths, which are ``cat=u/part=1`` and so on here, so it is the names that
-    tie a column to a key rather than its position.
+    Row ``i`` holds the values for path ``i``.
+    The columns might not be in the order the keys appear in the
+    paths.
 
     Parameters
     ----------
     df
-        Partition values, as polars hands them over.
+        Partition values.
     """
 
     df: pl.DataFrame
@@ -69,15 +65,14 @@ class HivePartitions:
         Parameters
         ----------
         df
-            One row per path in the scan, one column per hive key. Polars
-            narrows the columns to those the query actually needs, so a
-            zero-width frame means no hive columns are required.
+            One row per path in the scan, one column per hive key.
 
         Returns
         -------
         The partition values, or ``None`` if no hive columns are needed.
         """
         if df.width == 0:
+            # Polars filtered out all paths
             return None
         return cls(df)
 
@@ -138,7 +133,7 @@ class HivePartitions:
         """
         return self._to_columns(
             plc.filling.repeat(
-                self._value_table(self.df.head(1), stream=stream),
+                plc.Table.from_arrow(self.df.head(1), stream=stream),
                 num_rows,
                 stream=stream,
             )
@@ -165,7 +160,7 @@ class HivePartitions:
         """
         return self._to_columns(
             plc.filling.repeat(
-                self._value_table(self.df, stream=stream),
+                plc.Table.from_arrow(self.df, stream=stream),
                 plc.Column.from_arrow(
                     pl.Series(values=rows_per_path, dtype=pl.Int32()), stream=stream
                 ),
@@ -193,16 +188,12 @@ class HivePartitions:
         """
         return self._to_columns(
             plc.copying.gather(
-                self._value_table(self.df, stream=stream),
+                plc.Table.from_arrow(self.df, stream=stream),
                 source_index,
                 plc.copying.OutOfBoundsPolicy.DONT_CHECK,
                 stream=stream,
             )
         )
-
-    @staticmethod
-    def _value_table(df: pl.DataFrame, *, stream: Stream) -> plc.Table:
-        return plc.Table.from_arrow(df, stream=stream)
 
     def _to_columns(self, table: plc.Table) -> list[Column]:
         return [
@@ -212,22 +203,20 @@ class HivePartitions:
             )
         ]
 
-    @functools.cached_property
-    def _key(self) -> tuple[Any, ...]:
-        # Node digests fall back to repr() for anything that is not a tuple,
-        # and polars leaves the middle out of a tall frame's repr, so identity
-        # rests on something that spells out every value instead.
-        return (tuple(self.df.schema.items()), tuple(self.df.iter_rows()))
-
     def __repr__(self) -> str:
-        """Representation naming every partition value."""
-        schema, rows = self._key
-        return f"{type(self).__name__}(schema={dict(schema)!r}, values={rows!r})"
+        """Representation showing the partition values."""
+        return f"{type(self).__name__}(df={self.df!r})"
 
     def __hash__(self) -> int:
-        """Hash of the partition values."""
-        return hash(self._key)
+        """Hash of the schema and of every partition value."""
+        return hash(
+            (tuple(self.df.schema.items()), tuple(self.df.hash_rows().to_list()))
+        )
 
     def __eq__(self, other: Any) -> bool:
         """Whether two sets of partition values agree, dtypes included."""
-        return isinstance(other, HivePartitions) and self._key == other._key
+        return (
+            isinstance(other, HivePartitions)
+            and self.df.schema == other.df.schema
+            and self.df.equals(other.df)
+        )

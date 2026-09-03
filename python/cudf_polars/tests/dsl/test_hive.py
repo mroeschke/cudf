@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 
 import polars as pl
@@ -13,7 +11,6 @@ from polars.testing import assert_frame_equal
 import pylibcudf as plc
 
 from cudf_polars.containers import DataFrame, DataType
-from cudf_polars.dsl.nodebase import _update_stable_hasher
 from cudf_polars.dsl.utils.hive import HivePartitions
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
@@ -53,24 +50,39 @@ def test_dtypes_distinguish_identical_values() -> None:
     assert hash(narrow) != hash(wide)
 
 
-def test_tall_partitions_get_distinct_digests() -> None:
-    # Polars elides the middle of a tall frame's repr, and the stable node
-    # digest falls back to repr for anything that is not a tuple, so a repr
-    # of the frame alone would make these two indistinguishable.
+def test_names_distinguish_identical_values() -> None:
+    # hash_rows digests the values but not the column they sit in, so the
+    # schema is what tells these two apart.
+    values = [1, 2]
+    part = HivePartitions(pl.DataFrame({"part": values}))
+    cat = HivePartitions(pl.DataFrame({"cat": values}))
+    assert part != cat
+    assert hash(part) != hash(cat)
+
+
+def test_path_order_matters() -> None:
+    forwards = HivePartitions(pl.DataFrame({"part": [1, 2]}))
+    backwards = HivePartitions(pl.DataFrame({"part": [2, 1]}))
+    assert forwards != backwards
+    assert hash(forwards) != hash(backwards)
+
+
+def test_tall_partitions_are_distinguished() -> None:
+    # Polars elides the middle of a tall frame's repr, so identity cannot
+    # rest on it. hash_rows sees every row.
     tall = HivePartitions(pl.DataFrame({"part": range(40)}))
     other = HivePartitions(pl.DataFrame({"part": [*range(20), 999, *range(21, 40)]}))
     assert repr(tall.df) == repr(other.df)
-
-    def digest(partitions: HivePartitions) -> bytes:
-        hasher = hashlib.md5(usedforsecurity=False)
-        _update_stable_hasher(hasher, partitions)
-        return hasher.digest()
-
-    assert digest(tall) != digest(other)
+    assert tall != other
+    assert hash(tall) != hash(other)
 
 
 def test_not_equal_to_other_types(partitions: HivePartitions) -> None:
     assert partitions != partitions.df
+
+
+def test_repr(partitions: HivePartitions) -> None:
+    assert repr(partitions) == f"HivePartitions(df={partitions.df!r})"
 
 
 def test_num_paths(partitions: HivePartitions) -> None:
