@@ -140,8 +140,7 @@ class PerPathValues:
         """
         Materialize the values by repeating each path's row.
 
-        Used when there is no source index to gather with, so the number of
-        rows each path contributes has to be known up front.
+        Prefer gather when a source index is known.
 
         Parameters
         ----------
@@ -172,9 +171,7 @@ class PerPathValues:
         ----------
         source_index
             Column giving, for each output row, the index of the path it was
-            read from. This is what ``prepend_source_index_column`` produces,
-            and unlike per-source row counts it stays valid when the reader
-            applies a filter.
+            read from.
         stream
             CUDA stream used for device memory operations and kernel launches.
 
@@ -210,7 +207,7 @@ class PerPathValues:
         )
 
     def __eq__(self, other: Any) -> bool:
-        """Whether two sets of values agree, dtypes included."""
+        """Whether two sets of values agree."""
         return (
             isinstance(other, PerPathValues)
             and self.df.schema == other.df.schema

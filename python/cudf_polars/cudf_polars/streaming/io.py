@@ -220,8 +220,7 @@ def hybrid_scan_eligible(
         and row_index is None
         and include_file_paths is None
         and predicate is not None
-        # The hybrid reader has its own projection and filter handling, neither
-        # of which knows to keep hive columns out of what it asks the file for.
+        # TODO: Support hive partitioning
         and hive_parts is None
     )
 

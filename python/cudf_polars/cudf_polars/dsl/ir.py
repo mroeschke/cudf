@@ -717,7 +717,7 @@ class Scan(IR):
     parquet_options: ParquetOptions
     """Parquet-specific options."""
     hive_parts: PerPathValues | None
-    """Hive partition values, one per path, or None if the scan is not hive-partitioned."""
+    """Hive partition values, one per path."""
     cached_parquet_info: list[CachedParquetInfo] | None
     """Cached parquet file metadata."""
 
@@ -976,10 +976,7 @@ class Scan(IR):
         """
         Rows each path contributes, from file metadata.
 
-        Only usable when no filter is pushed down, since the reader decides
-        which rows survive a filter. That is guaranteed for the callers of
-        this method, which read no columns from the files at all: polars only
-        pushes a predicate down alongside the file columns it references.
+        Used when no filter is pushed down.
 
         Parameters
         ----------
@@ -992,8 +989,7 @@ class Scan(IR):
             Maximum number of rows to read once ``skip_rows`` have been
             skipped, or ``-1`` for no limit.
         cached_parquet_info
-            Prefetched file metadata. The footers are read when this is
-            ``None``.
+            Prefetched file metadata.
 
         Returns
         -------
@@ -1011,8 +1007,6 @@ class Scan(IR):
             ]
         available = max(sum(totals) - skip_rows, 0)
         budget = available if n_rows == -1 else min(n_rows, available)
-        # Paths beyond the budget contribute nothing, so the remaining zeros
-        # stand whether they were never reached or skipped over entirely.
         counts = [0] * len(totals)
         for i, total in enumerate(totals):
             if budget == 0:
@@ -1030,9 +1024,6 @@ class Scan(IR):
         """
         Split off the source index column the parquet reader prepends.
 
-        The reader synthesizes this column before applying any filter, so it
-        survives filter pushdown where per-source row counts do not.
-
         Parameters
         ----------
         table
@@ -1040,8 +1031,7 @@ class Scan(IR):
         names
             Column names of ``table``.
         prepended
-            Whether the reader was asked to prepend the source index. The
-            table and names are passed through untouched when it was not.
+            Whether the reader was asked to prepend the source index.
 
         Returns
         -------
@@ -1246,9 +1236,7 @@ class Scan(IR):
                     )
             # The reader drops its per-source row counts once it applies a
             # filter, so the source of each row has to be read instead. Hive
-            # columns need it too, unless every path shares the same partition
-            # values or the projection is empty, in which case the reader
-            # returns no rows and so no index either.
+            # columns need it too.
             prepend_source_index = (
                 hive_parts is not None
                 and not hive_parts.is_uniform

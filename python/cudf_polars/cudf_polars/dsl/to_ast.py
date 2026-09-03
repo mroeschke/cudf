@@ -279,8 +279,6 @@ def _extract_conjuncts(node: expr.Expr) -> list[expr.Expr]:
 def _to_parquet_filter(
     node: expr.Expr, mapper: Transformer, unreadable_columns: frozenset[str]
 ) -> plc_expr.Expression | None:
-    # Hive columns don't exist in the file, so a filter referencing one would
-    # name a column the reader cannot resolve.
     if unreadable_columns and any(
         isinstance(child, expr.Col) and child.name in unreadable_columns
         for child in traversal([node])

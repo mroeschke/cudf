@@ -1068,9 +1068,6 @@ def test_scan_parquet_hive_partitioned_dtypes(
 def test_scan_parquet_hive_only_projection_sliced(
     engine: pl.GPUEngine, tmp_path: Path, offset: int, length: int | None
 ) -> None:
-    # Projecting only a hive column reads nothing from the files, so each
-    # path's row count has to come from its metadata. Paths of differing
-    # heights mean a mis-split slice shows up as wrong partition values.
     root = tmp_path / "hive"
     for part, height in enumerate([3, 2, 4]):
         (root / f"part={part}").mkdir(parents=True)
@@ -1086,8 +1083,6 @@ def test_scan_parquet_hive_only_projection_sliced(
 def test_scan_parquet_hive_partitioned_uniform_multiple_files(
     engine: pl.GPUEngine, tmp_path: Path
 ) -> None:
-    # Several files under one partition, so every row gets the same hive value
-    # and the values can be broadcast rather than gathered.
     (tmp_path / "part=1").mkdir()
     for index in range(3):
         pl.DataFrame({"a": [index, index + 1]}).write_parquet(
