@@ -13,6 +13,7 @@ import pylibcudf as plc
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.utils.per_path import PerPathValues
 from cudf_polars.utils.cuda_stream import get_cuda_stream
+from cudf_polars.utils.versions import POLARS_VERSION_LT_138
 
 
 @pytest.fixture
@@ -32,6 +33,10 @@ def test_from_polars() -> None:
     assert got.dtypes == (DataType(pl.Int32()), DataType(pl.String()))
 
 
+@pytest.mark.skipif(
+    POLARS_VERSION_LT_138,
+    reason="height parameter added in Polars 1.38",
+)
 def test_from_polars_zero_width() -> None:
     assert PerPathValues.from_polars(pl.DataFrame(height=3)) is None
 
