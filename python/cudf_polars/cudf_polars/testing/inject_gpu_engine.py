@@ -145,6 +145,7 @@ EXPECTED_FAILURES: dict[str, str] = {
     "tests/unit/io/test_delta.py::test_scan_delta_schema_evolution_nested_struct_field_19915": "Delta schema evolution not yet implemented in cudf-polars: the table's files have differing column counts",
     "tests/unit/io/test_delta.py::test_scan_delta_nanosecond_timestamp": "polars generates the wrong schema: https://github.com/pola-rs/polars/issues/23949",
     "tests/unit/io/test_delta.py::test_scan_delta_nanosecond_timestamp_nested": "polars generates the wrong schema: https://github.com/pola-rs/polars/issues/23949",
+    "tests/unit/io/test_delta.py::test_write_delta": "Delta schema evolution not yet implemented in cudf-polars: 'All sources must have the same schema'",
     "tests/unit/io/test_iceberg.py::test_scan_iceberg_row_index_renamed": "Iceberg support not yet implemented in cudf-polars",
     "tests/unit/io/test_iceberg.py::test_scan_iceberg_extra_columns": "Iceberg support not yet implemented in cudf-polars",
     "tests/unit/io/test_iceberg.py::test_scan_iceberg_extra_struct_fields": "Iceberg support not yet implemented in cudf-polars",
