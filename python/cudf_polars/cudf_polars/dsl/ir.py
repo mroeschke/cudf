@@ -914,6 +914,25 @@ class Scan(IR):
             self.hive_parts,
         )
 
+    def slice_hive_parts(self, start: int, stop: int) -> PerPathValues | None:
+        """
+        Hive partition values for ``self.paths[start:stop]``.
+
+        Parameters
+        ----------
+        start
+            Index of the first path in the range.
+        stop
+            Index one past the last path in the range.
+
+        Returns
+        -------
+        Values for that range of paths, or None if this is not a hive scan.
+        """
+        if self.hive_parts is None:
+            return None
+        return self.hive_parts.slice(start, stop)
+
     @staticmethod
     def add_file_paths(
         name: str,

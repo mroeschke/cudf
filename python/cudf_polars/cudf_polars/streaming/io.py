@@ -152,13 +152,6 @@ def _rank_slice(total: int, rank: int, nranks: int) -> tuple[int, int]:
     return count * rank, count
 
 
-def _slice_hive_parts(ir: Scan, start: int, stop: int) -> PerPathValues | None:
-    """Return the hive partition values for ``ir.paths[start:stop]``."""
-    if ir.hive_parts is None:
-        return None
-    return ir.hive_parts.slice(start, stop)
-
-
 def expand_scan_for_rank(
     ir: Scan,
     plan: IOPartitionPlan,
@@ -201,7 +194,7 @@ def expand_scan_for_rank(
         tasks: list[ScanTask] = []
         splits_created = 0
         for path_index, path in enumerate(local_paths, start=path_offset):
-            hive_parts = _slice_hive_parts(ir, path_index, path_index + 1)
+            hive_parts = ir.slice_hive_parts(path_index, path_index + 1)
             while sindex < plan.factor and splits_created < local_count:
                 tasks.append(
                     ParquetScanTask(
@@ -232,7 +225,7 @@ def expand_scan_for_rank(
                         0,
                         1,
                         parquet_options,
-                        _slice_hive_parts(ir, offset, offset + plan.factor),
+                        ir.slice_hive_parts(offset, offset + plan.factor),
                     )
                 )
             else:
