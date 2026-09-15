@@ -1135,6 +1135,23 @@ def test_hive_partitioned_scan_skips_hybrid_scan(
 
 
 @requires_hive_ir
+@pytest.mark.parametrize("target_partition_size", [1_000, 1_000_000])
+def test_hive_only_projection_with_prefetched_metadata(
+    hive_root: Path,
+    streaming_engine_factory: Callable[..., StreamingEngine],
+    target_partition_size: int,
+) -> None:
+    streaming_engine = streaming_engine_factory(
+        StreamingOptions(
+            target_partition_size=target_partition_size,
+            parquet_options={"prefetch_file_metadata": True},
+        ),
+    )
+    q = pl.scan_parquet(hive_root, hive_partitioning=True).select("part")
+    assert_gpu_result_equal(q, engine=streaming_engine, check_row_order=False)
+
+
+@requires_hive_ir
 def test_hive_partitioned_scan_with_hybrid_scan_enabled(
     hive_root: Path,
     streaming_engine_factory: Callable[..., StreamingEngine],

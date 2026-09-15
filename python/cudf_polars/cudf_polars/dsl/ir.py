@@ -1036,7 +1036,6 @@ class Scan(IR):
         Rows contributed by each path, in source order.
         """
         if cached_parquet_info is not None:
-            Scan._validate_cached_parquet_info(paths, cached_parquet_info)
             totals = [info.file_metadata.num_rows for info in cached_parquet_info]
         else:
             totals = [
