@@ -957,7 +957,9 @@ class Scan(IR):
             Number of rows read from each path.
         source_index
             Column giving the source each output row came from. Takes
-            precedence over ``rows_per_path`` when both are available.
+            precedence over ``rows_per_path`` when both are available. The
+            caller is responsible for ensuring that its data is valid on
+            ``df.stream``.
 
         Returns
         -------
