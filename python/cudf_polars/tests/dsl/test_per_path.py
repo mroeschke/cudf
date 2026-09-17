@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 import polars as pl
@@ -99,7 +101,7 @@ def test_repr(per_path: PerPathValues) -> None:
         ({"part": [None, None], "cat": [None, None]}, True),
     ],
 )
-def test_is_uniform(values, expected) -> None:
+def test_is_uniform(values: dict[str, list[Any]], *, expected: bool) -> None:
     assert PerPathValues(pl.DataFrame(values)).is_uniform is expected
 
 
