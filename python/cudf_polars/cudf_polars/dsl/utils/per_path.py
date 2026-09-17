@@ -69,7 +69,7 @@ class PerPathValues:
         The partition values, or ``None`` if no hive columns are needed.
         """
         if df.width == 0:
-            # Polars filtered out all paths
+            # No hive columns are projected
             return None
         return cls(df)
 
@@ -114,8 +114,8 @@ class PerPathValues:
         """
         Materialize the values as columns of ``num_rows`` equal rows.
 
-        Only valid when :attr:`is_uniform` holds, since every output row is
-        given the values of the first path.
+        The caller must validate :attr:`is_uniform` is ``True``, since
+        every output row is given the values of the first path.
 
         Parameters
         ----------
