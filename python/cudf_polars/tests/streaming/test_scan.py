@@ -1072,7 +1072,6 @@ def test_hive_partitioned_split_tasks_slice_partitions(
     for task in streaming.tasks:
         assert isinstance(task, ParquetScanTask)
         assert task.hive_parts is not None
-        assert task.hive_parts.num_paths == 1
         assert task.hive_parts.is_uniform
         hive_parts.append(task.hive_parts)
     assert [parts.df.rows() for parts in hive_parts] == [

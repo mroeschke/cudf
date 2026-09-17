@@ -79,14 +79,9 @@ class PerPathValues:
         return tuple(self.df.columns)
 
     @functools.cached_property
-    def dtypes(self) -> tuple[DataType, ...]:
+    def _dtypes(self) -> tuple[DataType, ...]:
         """Datatype of each column."""
         return tuple(DataType(dtype) for dtype in self.df.dtypes)
-
-    @property
-    def num_paths(self) -> int:
-        """Number of paths these values describe."""
-        return self.df.height
 
     @functools.cached_property
     def is_uniform(self) -> bool:
@@ -193,7 +188,7 @@ class PerPathValues:
         return [
             Column(column, name=name, dtype=dtype)
             for column, name, dtype in zip(
-                table.columns(), self.names, self.dtypes, strict=True
+                table.columns(), self.names, self._dtypes, strict=True
             )
         ]
 

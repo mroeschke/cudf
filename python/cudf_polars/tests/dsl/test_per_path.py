@@ -10,7 +10,7 @@ from polars.testing import assert_frame_equal
 
 import pylibcudf as plc
 
-from cudf_polars.containers import DataFrame, DataType
+from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.utils.per_path import PerPathValues
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 from cudf_polars.utils.versions import POLARS_VERSION_LT_138
@@ -30,7 +30,6 @@ def test_from_polars() -> None:
     assert got == PerPathValues(df)
     assert got is not None
     assert got.names == ("part", "cat")
-    assert got.dtypes == (DataType(pl.Int32()), DataType(pl.String()))
 
 
 @pytest.mark.skipif(
@@ -88,10 +87,6 @@ def test_not_equal_to_other_types(per_path: PerPathValues) -> None:
 
 def test_repr(per_path: PerPathValues) -> None:
     assert repr(per_path) == f"PerPathValues(df={per_path.df!r})"
-
-
-def test_num_paths(per_path: PerPathValues) -> None:
-    assert per_path.num_paths == 3
 
 
 @pytest.mark.parametrize(
