@@ -1017,13 +1017,7 @@ def hive_root(tmp_path: Path) -> Path:
 
 
 @requires_hive_ir
-@pytest.mark.parametrize(
-    "target_partition_size,expected_flavor",
-    [
-        (1_000, IOPartitionFlavor.SPLIT_FILES),
-        (1_000_000, IOPartitionFlavor.FUSED_FILES),
-    ],
-)
+@pytest.mark.parametrize("target_partition_size", [1_000, 1_000_000])
 @pytest.mark.parametrize(
     "query",
     [
@@ -1039,7 +1033,6 @@ def test_hive_partitioned_streaming_scan(
     hive_root: Path,
     streaming_engine_factory: Callable[..., StreamingEngine],
     target_partition_size: int,
-    expected_flavor: IOPartitionFlavor,
     query,
 ) -> None:
     streaming_engine = streaming_engine_factory(
