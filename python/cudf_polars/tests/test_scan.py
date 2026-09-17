@@ -961,13 +961,24 @@ def test_scan_parquet_is_between_literal_dtype_mismatch_22622(
         lambda lf: lf.select("part").head(4),
         lambda lf: lf.slice(2, 5),
         lambda lf: lf.with_row_index(),
-        lambda lf: lf.group_by("part").agg(pl.col("a").sum()),
     ],
 )
 def test_scan_parquet_hive_partitioned(
     engine: pl.GPUEngine, hive_root: Path, query
 ) -> None:
     q = query(pl.scan_parquet(hive_root, hive_partitioning=True))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@requires_hive_ir
+def test_scan_parquet_hive_partitioned_group_by(
+    engine: pl.GPUEngine, hive_root: Path
+) -> None:
+    q = (
+        pl.scan_parquet(hive_root, hive_partitioning=True)
+        .group_by("part")
+        .agg(pl.col("a").sum())
+    )
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
