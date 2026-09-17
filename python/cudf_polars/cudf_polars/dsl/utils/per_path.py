@@ -171,7 +171,8 @@ class PerPathValues:
         ----------
         source_index
             Column giving, for each output row, the index of the path it was
-            read from.
+            read from. The caller is responsible for ensuring that source_index is
+            valid on ``stream``.
         stream
             CUDA stream used for device memory operations and kernel launches.
 
