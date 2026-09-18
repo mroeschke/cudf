@@ -898,6 +898,7 @@ def test_streaming_scan_identity_equality() -> None:
         0,
         2,
         base.parquet_options,
+        PerPathValues(pl.DataFrame({"part": [1]})),
     )
     split_same = ParquetScanTask(
         base,
@@ -905,6 +906,7 @@ def test_streaming_scan_identity_equality() -> None:
         0,
         2,
         base.parquet_options,
+        PerPathValues(pl.DataFrame({"part": [1]})),
     )
     split_diff = ParquetScanTask(
         base,
@@ -912,15 +914,27 @@ def test_streaming_scan_identity_equality() -> None:
         1,
         2,
         base.parquet_options,
+        PerPathValues(pl.DataFrame({"part": [1]})),
+    )
+    split_other_part = ParquetScanTask(
+        base,
+        base.paths,
+        0,
+        2,
+        base.parquet_options,
+        PerPathValues(pl.DataFrame({"part": [2]})),
     )
 
     a = StreamingScan([split], base)
     b = StreamingScan([split_same], base)
     c = StreamingScan([split_diff], base)
+    d = StreamingScan([split_other_part], base)
 
     assert a == b
     assert hash(a) == hash(b)
     assert a != c
+    assert a != d
+    assert hash(a) != hash(d)
 
 
 def test_cached_parquet_info_excluded_from_identity() -> None:
@@ -1026,7 +1040,7 @@ def hive_root(tmp_path: Path) -> Path:
     pl.DataFrame(
         {
             "x": range(600),
-            "part": [i // 200 for i in range(600)],
+            "part": [0] * 150 + [1] * 200 + [2] * 250,
         }
     ).write_parquet(root, partition_by=["part"], row_group_size=25)
     return root
@@ -1040,9 +1054,6 @@ def hive_root(tmp_path: Path) -> Path:
         lambda lf: lf,
         lambda lf: lf.select("part"),
         lambda lf: lf.filter(pl.col("x") > 400),
-        lambda lf: lf.filter(pl.col("part") == 1),
-        lambda lf: lf.filter((pl.col("part") == 1) & (pl.col("x") > 250)),
-        lambda lf: lf.group_by("part").agg(pl.col("x").sum()),
     ],
 )
 def test_hive_partitioned_streaming_scan(

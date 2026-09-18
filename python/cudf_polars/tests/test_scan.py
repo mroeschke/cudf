@@ -1119,3 +1119,58 @@ def test_scan_parquet_hive_partitioned_uniform_null_value(
         pl.DataFrame({"a": [index, index + 1]}).write_parquet(part / f"{index}.parquet")
     q = pl.scan_parquet(tmp_path, hive_schema={"part": pl.Int32})
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@requires_hive_ir
+@pytest.mark.parametrize(
+    "query",
+    [
+        lambda lf: lf,
+        lambda lf: lf.select("price"),
+        lambda lf: lf.filter(pl.col("price") > Decimal("2.00")),
+        lambda lf: lf.filter(pl.col("price") > Decimal("2.00")).select("price"),
+        lambda lf: lf.filter(pl.col("x") > 15),
+        lambda lf: lf.filter(pl.col("x") > 15).select("price"),
+    ],
+)
+def test_scan_parquet_hive_partitioned_decimal_key(
+    engine: pl.GPUEngine, tmp_path: Path, query
+) -> None:
+    root = tmp_path / "hive"
+    pl.DataFrame(
+        {
+            "price": [
+                Decimal("1.50"),
+                Decimal("2.25"),
+                Decimal("3.75"),
+                Decimal("4.00"),
+            ],
+            "x": [10, 20, 30, 40],
+        },
+        schema={"price": pl.Decimal(10, 2), "x": pl.Int64},
+    ).write_parquet(root, partition_by=["price"])
+    q = query(pl.scan_parquet(root, hive_schema={"price": pl.Decimal(10, 2)}))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@requires_hive_ir
+def test_scan_parquet_hive_partitioned_decimal_predicate(
+    engine: pl.GPUEngine, tmp_path: Path
+) -> None:
+    root = tmp_path / "hive"
+    pl.DataFrame(
+        {
+            "price": [
+                Decimal("1.50"),
+                Decimal("2.25"),
+                Decimal("3.75"),
+                Decimal("4.00"),
+            ],
+            "part": [1, 1, 2, 2],
+        },
+        schema={"price": pl.Decimal(10, 2), "part": pl.Int64},
+    ).write_parquet(root, partition_by=["part"])
+    q = pl.scan_parquet(root, hive_schema={"part": pl.Int64}).filter(
+        pl.col("price") > Decimal("2.00")
+    )
+    assert_gpu_result_equal(q, engine=engine)
