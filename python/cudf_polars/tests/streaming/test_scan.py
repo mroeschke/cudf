@@ -24,6 +24,7 @@ from cudf_polars.dsl.utils.io import (
     attach_cached_parquet_metadata,
     prefetch_parquet_file_metadata_for_ir,
 )
+from cudf_polars.dsl.utils.per_path import PerPathValues
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.io import resolve_max_concurrent_io_tasks
 from cudf_polars.streaming.base import (
@@ -741,6 +742,24 @@ def test_scan_path_mismatch_raises() -> None:
             scan.hive_parts,
             [],
             context=ctx,
+        )
+
+
+def test_hive_parts_path_mismatch_raises() -> None:
+    # Note: This isn't reachable by polars' public API.
+    scan = _make_parquet_scan(["a.parquet", "b.parquet"])
+
+    with pytest.raises(
+        AssertionError,
+        match=r"Expected 2 rows of hive partition values, got 1",
+    ):
+        ParquetScanTask(
+            scan,
+            scan.paths,
+            0,
+            1,
+            scan.parquet_options,
+            PerPathValues(pl.DataFrame({"part": [1]})),
         )
 
 

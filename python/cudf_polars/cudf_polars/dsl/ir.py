@@ -787,11 +787,7 @@ class Scan(IR):
         self.cached_parquet_info = cached_parquet_info
 
         Scan._validate_cached_parquet_info(self.paths, self.cached_parquet_info)
-        if self.hive_parts is not None:
-            assert self.hive_parts.df.height == len(self.paths), (
-                f"Expected {len(self.paths)} rows of hive partition values, "
-                f"got {self.hive_parts.df.height}"
-            )
+        Scan._validate_hive_parts_info(self.paths, self.hive_parts)
 
         if self.typ not in ("csv", "parquet", "ndjson"):  # pragma: no cover
             # This line is unhittable ATM since IPC/Anonymous scan raise
@@ -892,6 +888,18 @@ class Scan(IR):
             )
             raise AssertionError(
                 f"Paths do not match cached parquet info. Missing paths: {missing}"
+            )
+
+    @staticmethod
+    def _validate_hive_parts_info(
+        paths: list[str],
+        hive_parts: PerPathValues | None,
+    ) -> None:
+        # Note: Polars constructs hive_parts.df from len(paths)
+        if hive_parts is not None and hive_parts.df.height != len(paths):
+            raise AssertionError(
+                f"Expected {len(paths)} rows of hive partition values, "
+                f"got {hive_parts.df.height}"
             )
 
     def get_hashable(self) -> Hashable:
