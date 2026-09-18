@@ -1052,7 +1052,15 @@ def test_scan_parquet_hive_partitioned_chunked(hive_root: Path, query) -> None:
 @requires_hive_ir
 @pytest.mark.parametrize(
     "dtype",
-    [pl.Date, pl.Datetime("us"), pl.Float64, pl.Boolean, pl.Int64, pl.String],
+    [
+        pl.Date,
+        pl.Datetime("us"),
+        pl.Float64,
+        pl.Boolean,
+        pl.Int32,
+        pl.Int64,
+        pl.String,
+    ],
 )
 @pytest.mark.parametrize(
     "query", [lambda lf: lf, lambda lf: lf.select("part")], ids=["all", "hive_only"]
@@ -1097,5 +1105,17 @@ def test_scan_parquet_hive_partitioned_uniform_multiple_files(
         pl.DataFrame({"a": [index, index + 1]}).write_parquet(
             tmp_path / "part=1" / f"{index}.parquet"
         )
+    q = pl.scan_parquet(tmp_path, hive_schema={"part": pl.Int32})
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@requires_hive_ir
+def test_scan_parquet_hive_partitioned_uniform_null_value(
+    engine: pl.GPUEngine, tmp_path: Path
+) -> None:
+    part = tmp_path / "part=__HIVE_DEFAULT_PARTITION__"
+    part.mkdir()
+    for index in range(2):
+        pl.DataFrame({"a": [index, index + 1]}).write_parquet(part / f"{index}.parquet")
     q = pl.scan_parquet(tmp_path, hive_schema={"part": pl.Int32})
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
