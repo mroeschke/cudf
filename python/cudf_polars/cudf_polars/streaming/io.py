@@ -517,6 +517,11 @@ class ParquetScanTask(ScanTask):
             raise ValueError(f"Expected a parquet scan, got: {base_scan.typ}")
         if total_splits > 1 and len(paths) > 1:
             raise ValueError(f"Expected a single path for a split task, got: {paths}")
+        if hive_parts is not None:
+            assert hive_parts.df.height == len(paths), (
+                f"Expected {len(paths)} rows of hive partition values, "
+                f"got {hive_parts.df.height}"
+            )
         super().__init__(base_scan, paths, split_index, total_splits)
         self.parquet_options = parquet_options
         self.hive_parts = hive_parts
