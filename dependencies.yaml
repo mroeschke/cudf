@@ -714,7 +714,7 @@ files:
   test_cudf_polars_compat:
     output: none
     matrix:
-      polars_compat_version: ["1.35", "1.36", "1.37", "1.38", "1.39", "1.40", "1.41", "1.42", "1.43", "1.44"]
+      polars_compat_version: ["2.0"]
     includes:
       - test_cudf_polars_compat
 channels:
@@ -1099,7 +1099,7 @@ dependencies:
           # 'nvidia-ml-py' provides the 'pynvml' module
           - &nvidia_ml_py nvidia-ml-py>=12
           - packaging
-          - polars>=1.35,<1.45
+          - polars>=2.0.0rc2,<2.1
           - typing_extensions>=4.0.0
   run_cudf_polars_dask:
     common:
@@ -1300,6 +1300,9 @@ dependencies:
           # Used by ci/timeout_with_stack.py utility
           - psutil
           - *pandas
+          # Used to build Iceberg and Delta Lake tables to scan
+          - deltalake>=1.6.0
+          - pyiceberg>=0.12.0
       - output_types: conda
         packages:
           # Used by timeout_with_stack.py utility
@@ -1910,44 +1913,8 @@ dependencies:
       - output_types: [requirements, constraints]
         matrices:
           - matrix:
-              polars_compat_version: "1.35"
+              polars_compat_version: "2.0"
             packages:
-              - polars==1.35.*
-          - matrix:
-              polars_compat_version: "1.36"
-            packages:
-              - polars==1.36.*
-          - matrix:
-              polars_compat_version: "1.37"
-            packages:
-              - polars==1.37.*
-          - matrix:
-              polars_compat_version: "1.38"
-            packages:
-              - polars==1.38.*
-          - matrix:
-              polars_compat_version: "1.39"
-            packages:
-              - polars==1.39.*
-          - matrix:
-              polars_compat_version: "1.40"
-            packages:
-              - polars==1.40.*
-          - matrix:
-              polars_compat_version: "1.41"
-            packages:
-              - polars==1.41.*
-          - matrix:
-              polars_compat_version: "1.42"
-            packages:
-              - polars==1.42.*
-          - matrix:
-              polars_compat_version: "1.43"
-            packages:
-              - polars==1.43.*
-          - matrix:
-              polars_compat_version: "1.44"
-            packages:
-              - polars==1.44.*
+              - polars==2.0.*
           - matrix:
             packages:
