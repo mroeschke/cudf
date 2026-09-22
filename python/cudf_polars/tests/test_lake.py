@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import pyarrow as pa
 import pytest
 
 import polars as pl
@@ -44,56 +43,40 @@ def iceberg_catalog(tmp_path: Path):
 def flat_iceberg(tmp_path: Path) -> str:
     """An Iceberg table of two data files that share one schema."""
     catalog = iceberg_catalog(tmp_path)
-    table = pa.table(
-        {
-            "a": pa.array([1, 2, 3], type=pa.int64()),
-            "b": pa.array(["x", "y", "z"], type=pa.string()),
-        }
-    )
-    tbl = catalog.create_table("ns.flat", schema=table.schema)
-    tbl.append(table)
-    tbl.append(
-        pa.table(
-            {
-                "a": pa.array([4, 5], type=pa.int64()),
-                "b": pa.array(["p", "q"], type=pa.string()),
-            }
-        )
-    )
+    first = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    tbl = catalog.create_table("ns.flat", schema=first.to_arrow().schema)
+    first.lazy().sink_iceberg(tbl, mode="append")
+    pl.LazyFrame({"a": [4, 5], "b": ["p", "q"]}).sink_iceberg(tbl, mode="append")
     return tbl.metadata_location
 
 
 @pytest.fixture
 def evolved_iceberg(tmp_path: Path) -> str:
-    """An Iceberg table whose data files disagree on names, types and columns."""
-    from pyiceberg.types import DoubleType, LongType
+    """
+    An Iceberg table whose data files disagree on names, types and columns.
 
+    Sinking a wider frame with ``schema_mode="merge"`` promotes ``a`` to
+    Int64 and adds ``c``, so the first data file ends up disagreeing with
+    the table schema on both, as well as on the name of field 2.
+    """
     catalog = iceberg_catalog(tmp_path)
-    first = pa.table(
-        {
-            "a": pa.array([1, 2, 3], type=pa.int32()),
-            "b": pa.array(["x", "y", "z"], type=pa.string()),
-        }
+    first = pl.DataFrame(
+        {"a": pl.Series([1, 2, 3], dtype=pl.Int32), "b": ["x", "y", "z"]}
     )
-    tbl = catalog.create_table("ns.evolved", schema=first.schema)
-    tbl.append(first)
+    tbl = catalog.create_table("ns.evolved", schema=first.to_arrow().schema)
+    first.lazy().sink_iceberg(tbl, mode="append")
 
     with tbl.update_schema() as update:
         update.rename_column("b", "b_renamed")
-    with tbl.update_schema() as update:
-        update.update_column("a", field_type=LongType())
-    with tbl.update_schema() as update:
-        update.add_column("c", DoubleType())
+    tbl.refresh()
 
-    tbl.append(
-        pa.table(
-            {
-                "a": pa.array([4, 5], type=pa.int64()),
-                "b_renamed": pa.array(["p", "q"], type=pa.string()),
-                "c": pa.array([1.5, 2.5], type=pa.float64()),
-            }
-        )
-    )
+    pl.LazyFrame(
+        {
+            "a": pl.Series([4, 5], dtype=pl.Int64),
+            "b_renamed": ["p", "q"],
+            "c": [1.5, 2.5],
+        }
+    ).sink_iceberg(tbl, mode="append", schema_mode="merge")
     return tbl.metadata_location
 
 
@@ -116,13 +99,8 @@ def partitioned_iceberg(tmp_path: Path) -> str:
         )
     )
     tbl = catalog.create_table("ns.partitioned", schema=schema, partition_spec=spec)
-    tbl.append(
-        pa.table(
-            {
-                "a": pa.array([1, 2, 3, 4], type=pa.int64()),
-                "part": pa.array(["u", "u", "v", "v"], type=pa.string()),
-            }
-        )
+    pl.LazyFrame({"a": [1, 2, 3, 4], "part": ["u", "u", "v", "v"]}).sink_iceberg(
+        tbl, mode="append"
     )
     return tbl.metadata_location
 
@@ -131,43 +109,28 @@ def partitioned_iceberg(tmp_path: Path) -> str:
 def flat_delta(tmp_path: Path) -> str:
     """A Delta table of two data files."""
     path = tmp_path / "delta"
-    deltalake.write_deltalake(
-        str(path),
-        pa.table(
-            {
-                "a": pa.array([1, 2, 3], type=pa.int64()),
-                "b": pa.array(["x", "y", "z"], type=pa.string()),
-            }
-        ),
-        mode="overwrite",
+    pl.LazyFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]}).sink_delta(
+        str(path), mode="overwrite"
     )
-    deltalake.write_deltalake(
-        str(path),
-        pa.table(
-            {
-                "a": pa.array([4, 5], type=pa.int64()),
-                "b": pa.array(["p", "q"], type=pa.string()),
-            }
-        ),
-        mode="append",
-    )
+    pl.LazyFrame({"a": [4, 5], "b": ["p", "q"]}).sink_delta(str(path), mode="append")
     return str(path)
 
 
 @pytest.fixture
-def deletion_vector_delta(tmp_path: Path) -> str:
-    """A Delta table that records deleted rows in a deletion vector."""
-    path = tmp_path / "delta_dv"
-    deltalake.write_deltalake(
+def deleted_rows_delta(tmp_path: Path) -> str:
+    """
+    A Delta table some of whose rows have been deleted.
+
+    Deletion vectors are requested but delta-rs does not write them, so it
+    rewrites the data files instead. The scan of a real deletion vector is
+    covered by polars' own ``test_delta_deletion_vector.py``, which hand
+    writes one.
+    """
+    path = tmp_path / "delta_deleted"
+    pl.LazyFrame({"a": list(range(10)), "b": [f"s{i}" for i in range(10)]}).sink_delta(
         str(path),
-        pa.table(
-            {
-                "a": pa.array(list(range(10)), type=pa.int64()),
-                "b": pa.array([f"s{i}" for i in range(10)], type=pa.string()),
-            }
-        ),
         mode="overwrite",
-        configuration={"delta.enableDeletionVectors": "true"},
+        delta_write_options={"configuration": {"delta.enableDeletionVectors": "true"}},
     )
     deltalake.DeltaTable(str(path)).delete("a % 3 == 0")
     return str(path)
@@ -231,19 +194,15 @@ def test_scan_iceberg_row_index(engine: pl.GPUEngine, evolved_iceberg: str) -> N
     )
 
 
-def test_scan_delta_deletion_vectors(
-    engine: pl.GPUEngine, deletion_vector_delta: str
-) -> None:
-    assert_gpu_result_equal(
-        pl.scan_delta(deletion_vector_delta).sort("a"), engine=engine
-    )
+def test_scan_delta_deleted_rows(engine: pl.GPUEngine, deleted_rows_delta: str) -> None:
+    assert_gpu_result_equal(pl.scan_delta(deleted_rows_delta).sort("a"), engine=engine)
 
 
-def test_scan_delta_deletion_vectors_count(
-    engine: pl.GPUEngine, deletion_vector_delta: str
+def test_scan_delta_deleted_rows_count(
+    engine: pl.GPUEngine, deleted_rows_delta: str
 ) -> None:
     assert_gpu_result_equal(
-        pl.scan_delta(deletion_vector_delta).select(pl.len()), engine=engine
+        pl.scan_delta(deleted_rows_delta).select(pl.len()), engine=engine
     )
 
 
