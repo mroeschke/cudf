@@ -29,6 +29,7 @@ from cudf_polars.dsl.to_ast import insert_colrefs
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.aggregations import decompose_single_agg
 from cudf_polars.dsl.utils.groupby import rewrite_groupby
+from cudf_polars.dsl.utils.lake import LakeScanOptions
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.dsl.utils.per_path import PerPathValues
 from cudf_polars.dsl.utils.replace import replace
@@ -537,11 +538,7 @@ def _(node: plrs._ir_nodes.Scan, translator: Translator, schema: Schema) -> ir.I
     with_columns = file_options.with_columns
     row_index = file_options.row_index
     include_file_paths = file_options.include_file_paths
-    deletion_files = file_options.deletion_files
-    if deletion_files:  # pragma: no cover
-        raise NotImplementedError(
-            "Iceberg format is not supported in cudf-polars. Furthermore, row-level deletions are not supported."
-        )  # pragma: no cover
+    lake_options = LakeScanOptions.from_file_options(file_options, node.paths)
     hive_parts = (
         None
         if POLARS_VERSION_LT_142 or node.hive_parts is None
@@ -596,6 +593,7 @@ def _(node: plrs._ir_nodes.Scan, translator: Translator, schema: Schema) -> ir.I
         parquet_options,
         hive_parts=hive_parts,
         cached_parquet_info=None,
+        lake_options=lake_options,
     )
 
 
