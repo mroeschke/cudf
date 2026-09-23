@@ -1300,8 +1300,7 @@ dependencies:
           # Used by ci/timeout_with_stack.py utility
           - psutil
           - *pandas
-          # Required by polars' own scan_iceberg/scan_delta and sinks, and
-          # used directly for the table setup they cannot express
+          # cudf-polars unit tests for iceberg/delta IO
           - deltalake>=1.6.0
           - pyiceberg>=0.12.0
       - output_types: conda

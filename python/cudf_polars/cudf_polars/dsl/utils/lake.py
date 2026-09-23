@@ -130,6 +130,25 @@ class LakeScanOptions:
     cast_columns_policy: Mapping[str, Any]
     row_count: tuple[int, int] | None
 
+    def __post_init__(self) -> None:  # noqa: D105
+        if self.columns is not None and any(column.children for column in self.columns):
+            raise NotImplementedError("Iceberg column mapping of nested columns")
+        if self.extra_columns_policy not in ("ignore", "raise"):
+            raise NotImplementedError(  # pragma: no cover; only two policies exist
+                f"Extra columns policy {self.extra_columns_policy!r}"
+            )
+        if self.missing_columns_policy not in ("insert", "raise"):
+            raise NotImplementedError(  # pragma: no cover; only two policies exist
+                f"Missing columns policy {self.missing_columns_policy!r}"
+            )
+        unknown_defaults = set(self.initial_defaults) - {
+            column.physical_id for column in self.columns or ()
+        }
+        if unknown_defaults:  # pragma: no cover; polars keys defaults by schema id
+            raise NotImplementedError(
+                f"Iceberg defaults for unmapped fields {sorted(unknown_defaults)}"
+            )
+
     @classmethod
     def from_file_options(
         cls, file_options: Any, paths: Sequence[str]

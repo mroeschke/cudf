@@ -798,8 +798,10 @@ class Scan(IR):
 
         Scan._validate_cached_parquet_info(self.paths, self.cached_parquet_info)
         Scan._validate_hive_parts_info(self.paths, self.hive_parts)
-        if self.lake_options is not None:
-            Scan._validate_lake_options(self.typ, self.schema, self.lake_options)
+        if (
+            self.lake_options is not None and self.typ != "parquet"
+        ):  # pragma: no cover; polars only builds parquet lake scans
+            raise NotImplementedError(f"Iceberg or Delta scan of {self.typ} files")
 
         if self.typ not in ("csv", "parquet", "ndjson"):  # pragma: no cover
             # This line is unhittable ATM since IPC/Anonymous scan raise
@@ -903,7 +905,7 @@ class Scan(IR):
             )
 
     @staticmethod
-    def _partition_columns(
+    def _partition_lake_columns(
         lake_options: LakeScanOptions,
         schema: Schema,
         with_columns: list[str] | None,
@@ -925,34 +927,6 @@ class Scan(IR):
         if frame.width == 0:
             return []
         return PerPathValues(frame).repeat(rows_per_path, stream=stream)
-
-    @staticmethod
-    def _validate_lake_options(
-        typ: str,
-        schema: Schema,
-        lake_options: LakeScanOptions,
-    ) -> None:
-        if typ != "parquet":  # pragma: no cover; polars only builds parquet lake scans
-            raise NotImplementedError(f"Iceberg or Delta scan of {typ} files")
-        if lake_options.columns is not None and any(
-            column.children for column in lake_options.columns
-        ):
-            raise NotImplementedError("Iceberg column mapping of nested columns")
-        if lake_options.extra_columns_policy not in ("ignore", "raise"):
-            raise NotImplementedError(  # pragma: no cover; only two policies exist
-                f"Extra columns policy {lake_options.extra_columns_policy!r}"
-            )
-        if lake_options.missing_columns_policy not in ("insert", "raise"):
-            raise NotImplementedError(  # pragma: no cover; only two policies exist
-                f"Missing columns policy {lake_options.missing_columns_policy!r}"
-            )
-        unknown_defaults = set(lake_options.initial_defaults) - {
-            column.physical_id for column in lake_options.columns or ()
-        }
-        if unknown_defaults:  # pragma: no cover; polars keys defaults by schema id
-            raise NotImplementedError(
-                f"Iceberg defaults for unmapped fields {sorted(unknown_defaults)}"
-            )
 
     @staticmethod
     def _validate_hive_parts_info(
@@ -1356,7 +1330,7 @@ class Scan(IR):
             )
             if lake_options.partition_values:
                 df = df.with_columns(
-                    Scan._partition_columns(
+                    Scan._partition_lake_columns(
                         lake_options,
                         file_schema,
                         with_columns,

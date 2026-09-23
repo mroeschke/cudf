@@ -17,6 +17,8 @@ from cudf_polars.containers.datatype import DataType
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    import pyarrow as pa
+
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.utils.lake import LakeScanOptions
@@ -33,12 +35,6 @@ def deletion_mask(
 ) -> Column | None:
     """
     Build the mask of rows a lake scan keeps.
-
-    Iceberg and Delta record deleted rows outside the data files, so a scan
-    has to read every row and drop the deleted ones afterwards. The
-    positions are physical, that is relative to the start of the data file
-    they belong to, which is why the mask is assembled per path and then
-    concatenated in scan order.
 
     Parameters
     ----------
@@ -58,10 +54,13 @@ def deletion_mask(
     """
     masks = []
     deleted = False
+    puffin_cache: dict[str, dict[str, pa.ChunkedArray]] = {}
     for index, (path, num_rows) in enumerate(zip(paths, rows_per_path, strict=True)):
         selection = lake_options.delta_selections.get(index)
         if selection is None:
-            positions = _iceberg_positions(index, path, lake_options, stream=stream)
+            positions = _iceberg_positions(
+                index, path, lake_options, puffin_cache, stream=stream
+            )
             mask = (
                 plc.Column.from_scalar(
                     plc.Scalar.from_py(
@@ -128,16 +127,12 @@ def apply_deletions(
     Returns
     -------
     The frame without the deleted rows.
-
-    Notes
-    -----
-    A frame of no columns only tracks how many rows it has, so there is
-    nothing for a filter to act on and the kept rows have to be counted.
     """
     mask = deletion_mask(paths, rows_per_path, lake_options, stream=stream)
     if mask is None:
         return df
     if not df.columns:
+        # Preserve the row counts
         kept_count = plc.stream_compaction.apply_retention_mask(
             plc.Table([mask.obj]), mask.obj, stream=stream
         ).num_rows()
@@ -165,7 +160,7 @@ def _mask_from_positions(
             [
                 plc.Column.from_scalar(
                     plc.Scalar.from_py(
-                        False,  # noqa: FBT003
+                        True,  # noqa: FBT003
                         plc.DataType(plc.TypeId.BOOL8),
                         stream=stream,
                     ),
@@ -180,7 +175,12 @@ def _mask_from_positions(
 
 
 def _iceberg_positions(
-    index: int, path: str, lake_options: LakeScanOptions, *, stream: Stream
+    index: int,
+    path: str,
+    lake_options: LakeScanOptions,
+    puffin_cache: dict[str, dict[str, pa.ChunkedArray]],
+    *,
+    stream: Stream,
 ) -> plc.Column | None:
     """Positions of the rows deleted from one Iceberg data file."""
     delete_files = lake_options.position_deletes.get(index)
@@ -194,10 +194,18 @@ def _iceberg_positions(
     puffin = lake_options.deletion_vectors.get(index)
     if puffin is None:
         return None
-    from polars.io.iceberg._utils import load_puffin_deletion_file
+    if puffin not in puffin_cache:
+        # polars.scan_iceberg imports pyiceberg, so pyiceberg should be available
+        from pyiceberg.table.deletion_vector import deletion_vectors_from_puffin_file
+        from pyiceberg.table.puffin import PuffinFile
 
-    deletions = load_puffin_deletion_file(Path(puffin).read_bytes())
-    positions_series = deletions.get(path)
-    if positions_series is None:  # pragma: no cover; polars keys on the scan path
+        puffin_cache[puffin] = {
+            vector.referenced_data_file: vector.to_vector()
+            for vector in deletion_vectors_from_puffin_file(
+                PuffinFile(Path(puffin).read_bytes())
+            )
+        }
+    positions = puffin_cache[puffin].get(path)
+    if positions is None:  # pragma: no cover; polars keys on the scan path
         return None
-    return plc.Column.from_arrow(positions_series.to_arrow(), stream=stream)
+    return plc.Column.from_arrow(positions, stream=stream)

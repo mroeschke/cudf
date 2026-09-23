@@ -115,9 +115,7 @@ def _prefetch_parquet_footers_for_paths(
     parse_hybrid_metadata
         Whether to eagerly parse ``HybridScanMetadata`` for each path.
     uniform_schema
-        Whether every path stores the same columns. Reading the footers of
-        a whole group at once requires that, so an Iceberg table whose data
-        files disagree has to be read one path at a time.
+        Whether every path stores the same columns.
 
     Returns
     -------
@@ -150,6 +148,7 @@ def _prefetch_parquet_footers_for_paths(
             plc.io.types.SourceInfo(sources)
         )
     else:
+        # Might not be the case for Iceberg reads
         metadata = [
             plc.io.parquet_metadata.read_parquet_footers(
                 plc.io.types.SourceInfo([source])
