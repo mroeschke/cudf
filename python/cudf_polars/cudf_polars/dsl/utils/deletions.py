@@ -23,8 +23,6 @@ if TYPE_CHECKING:
 
 __all__ = ["apply_deletions", "deletion_mask"]
 
-BOOL = DataType(pl.Boolean())
-
 
 def deletion_mask(
     paths: Sequence[str],
@@ -65,17 +63,32 @@ def deletion_mask(
         if selection is None:
             positions = _iceberg_positions(index, path, lake_options, stream=stream)
             mask = (
-                _keep_all(num_rows, stream=stream)
+                plc.Column.from_scalar(
+                    plc.Scalar.from_py(
+                        True,  # noqa: FBT003
+                        plc.DataType(plc.TypeId.BOOL8),
+                        stream=stream,
+                    ),
+                    num_rows,
+                    stream=stream,
+                )
                 if positions is None
                 else _mask_from_positions(positions, num_rows, stream=stream)
             )
             deleted |= positions is not None
         else:
-            mask = _pad(
-                plc.Column.from_arrow(selection.to_arrow(), stream=stream),
-                num_rows,
-                stream=stream,
-            )
+            mask = plc.Column.from_arrow(selection.to_arrow(), stream=stream)
+            if mask.size() < num_rows:
+                padding = plc.Column.from_scalar(
+                    plc.Scalar.from_py(
+                        True,  # noqa: FBT003
+                        plc.DataType(plc.TypeId.BOOL8),
+                        stream=stream,
+                    ),
+                    num_rows - mask.size(),
+                    stream=stream,
+                )
+                mask = plc.concatenate.concatenate([mask, padding], stream=stream)
             deleted = True
         masks.append(mask)
     if not deleted:
@@ -84,7 +97,7 @@ def deletion_mask(
         plc.concatenate.concatenate(masks, stream=stream)
         if len(masks) > 1
         else masks[0],
-        dtype=BOOL,
+        dtype=DataType(pl.Boolean()),
     )
 
 
@@ -125,38 +138,11 @@ def apply_deletions(
     if mask is None:
         return df
     if not df.columns:
-        return DataFrame([], num_rows=_count_kept(mask, stream=stream), stream=stream)
+        kept_count = plc.stream_compaction.apply_retention_mask(
+            plc.Table([mask.obj]), mask.obj, stream=stream
+        ).num_rows()
+        return DataFrame([], num_rows=kept_count, stream=stream)
     return df.filter(mask)
-
-
-def _count_kept(mask: Column, *, stream: Stream) -> int:
-    return plc.stream_compaction.apply_retention_mask(
-        plc.Table([mask.obj]), mask.obj, stream=stream
-    ).num_rows()
-
-
-def _keep_all(num_rows: int, *, stream: Stream) -> plc.Column:
-    return plc.Column.from_scalar(
-        plc.Scalar.from_py(
-            True,  # noqa: FBT003
-            BOOL.plc_type,
-            stream=stream,
-        ),
-        num_rows,
-        stream=stream,
-    )
-
-
-def _pad(mask: plc.Column, num_rows: int, *, stream: Stream) -> plc.Column:
-    """Match a mask to the rows of its file, keeping any rows it does not cover."""
-    if mask.size() > num_rows:  # pragma: no cover; polars never sends a longer mask
-        (mask,) = plc.copying.slice(mask, [0, num_rows], stream=stream)
-        return mask
-    if mask.size() < num_rows:
-        return plc.concatenate.concatenate(
-            [mask, _keep_all(num_rows - mask.size(), stream=stream)], stream=stream
-        )
-    return mask
 
 
 def _mask_from_positions(
@@ -170,12 +156,24 @@ def _mask_from_positions(
         [
             plc.Scalar.from_py(
                 False,  # noqa: FBT003
-                BOOL.plc_type,
+                plc.DataType(plc.TypeId.BOOL8),
                 stream=stream,
             )
         ],
         positions,
-        plc.Table([_keep_all(num_rows, stream=stream)]),
+        plc.Table(
+            [
+                plc.Column.from_scalar(
+                    plc.Scalar.from_py(
+                        False,  # noqa: FBT003
+                        plc.DataType(plc.TypeId.BOOL8),
+                        stream=stream,
+                    ),
+                    num_rows,
+                    stream=stream,
+                )
+            ]
+        ),
         stream=stream,
     ).columns()
     return mask

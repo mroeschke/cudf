@@ -911,13 +911,7 @@ class Scan(IR):
         *,
         stream: Stream,
     ) -> list[Column]:
-        """
-        Materialize the identity-transformed partition fields of an Iceberg scan.
-
-        The value of such a field is constant within a data file and is
-        recorded in the table metadata, so polars hands us one value per
-        path rather than expecting us to read it.
-        """
+        """Materialize the partition fields of an Iceberg scan."""
         assert lake_options.columns is not None
         names = {column.physical_id: column.name for column in lake_options.columns}
         frame = pl.DataFrame(
@@ -2170,11 +2164,7 @@ class Select(IR):
         """
         Rows a parquet scan produces, or ``None`` if a read is needed.
 
-        The row counts in the parquet footers do not account for the rows an
-        Iceberg or Delta scan deletes. Such a scan can still be counted
-        without reading anything when the table metadata reports how many
-        rows were deleted, which polars passes on. It is also the only way
-        to count a table whose data files are no longer there.
+        Polars passes on deleted row counts for Iceberg and Delta scans.
         """
         lake_options = scan.lake_options
         if lake_options is not None and lake_options.row_count is not None:
