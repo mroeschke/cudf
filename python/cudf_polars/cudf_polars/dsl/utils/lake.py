@@ -481,10 +481,6 @@ class _Footer:
     keys: tuple[Any, ...]
     num_rows: int
 
-    def key_of(self, name: str) -> Any:
-        """The key the read of a column named ``name`` maps onto."""
-        return dict(zip(self.names, self.keys, strict=True))[name]
-
 
 def _footer(
     path: str,
@@ -543,8 +539,9 @@ def _read_group(
         if not by_field_id:
             options.set_column_names(list(present))
         table = plc.io.parquet.read_parquet(options, stream=stream)
+        key_by_name = dict(zip(footer.names, footer.keys, strict=True))
         read = {
-            footer.key_of(name): column
+            key_by_name[name]: column
             for name, column in zip(
                 table.column_names(include_children=False),
                 table.tbl.columns(),
