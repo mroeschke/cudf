@@ -404,9 +404,11 @@ def read_lake_files(
     The concatenated frame and the number of rows each path contributed.
     """
     by_field_id = lake_options.columns is not None
-    projected = [
-        name for name in schema if with_columns is None or name in with_columns
-    ]
+    projected = (
+        frozenset(schema)
+        if with_columns is None
+        else frozenset(schema).intersection(with_columns)
+    )
     wanted: dict[Any, str]
     if lake_options.columns is not None:
         wanted = {
@@ -416,7 +418,7 @@ def read_lake_files(
             and column.physical_id not in lake_options.partition_values
         }
     else:
-        wanted = {name: name for name in projected}
+        wanted = {name: name for name in schema if name in projected}
 
     metadatas: Sequence[plc.io.parquet_metadata.FileMetaData | None] = (
         [None] * len(paths)
@@ -433,10 +435,11 @@ def read_lake_files(
     start = 0
     for keys, group in itertools.groupby(footers, key=lambda footer: footer.keys):
         stop = start + len(list(group))
+        present = frozenset(keys)
         frames.append(
             _read_group(
                 paths[start:stop],
-                [key for key in wanted if key in frozenset(keys)],
+                [key for key in wanted if key in present],
                 footers[start],
                 sum(rows_per_path[start:stop]),
                 wanted,
