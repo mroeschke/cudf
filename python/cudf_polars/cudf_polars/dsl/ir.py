@@ -1324,9 +1324,15 @@ class Scan(IR):
             file_schema = {
                 name: schema[name] for name in output_names if name not in hive_names
             }
+            Scan._validate_cached_parquet_info(paths, cached_parquet_info)
             rows_per_path: list[int] | None
             df, rows_per_path = read_lake_files(
-                paths, lake_options, file_schema, with_columns, stream=stream
+                paths,
+                lake_options,
+                file_schema,
+                with_columns,
+                cached_parquet_info,
+                stream=stream,
             )
             if lake_options.partition_values:
                 df = df.with_columns(

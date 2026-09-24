@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from rmm.pylibrmm.stream import Stream
 
+    from cudf_polars.dsl.utils.io import CachedParquetInfo
     from cudf_polars.typing import Schema
 
 __all__ = ["IcebergColumn", "LakeScanOptions", "read_lake_files"]
@@ -52,10 +53,12 @@ class IcebergColumn:
         Parameters
         ----------
         spec
-            ``(name, physical_id, type_)`` where ``type_`` is one of
-            ``("primitive", dtype)``, ``("list", column)``,
-            ``("fixed-size-list", column, width)``,
-            ``("map", key, value)`` or ``("struct", {physical_id: column})``.
+            ``(name, physical_id, type_)`` where ``type_`` is one of:
+                * ``("primitive", dtype)``
+                * ``("list", column)``
+                * ``("fixed-size-list", column, width)``
+                * ``("map", key, value)``
+                * ``("struct", {physical_id: column})``
 
         Returns
         -------
@@ -80,10 +83,6 @@ class IcebergColumn:
 class LakeScanOptions:
     """
     The Iceberg and Delta Lake specific parts of a polars ``Scan``.
-
-    ``polars.scan_iceberg`` and ``polars.scan_delta`` both resolve to a
-    native parquet scan carrying this extra information, which describes how
-    to turn the physical files into the table the user asked for.
 
     Parameters
     ----------
@@ -185,13 +184,66 @@ class LakeScanOptions:
         table, which cannot be sent to another process, so it is resolved
         here rather than in the tasks that read the files.
         """
-        columns = _parse_column_mapping(file_options.column_mapping)
-        position_deletes, deletion_vectors, delta_selections = _parse_deletion_files(
-            file_options.deletion_files, paths
-        )
-        partition_values, initial_defaults = _parse_default_values(
-            file_options.default_values
-        )
+        column_mapping = file_options.column_mapping
+        columns: tuple[IcebergColumn, ...] | None = None
+        if column_mapping is not None:
+            mapping_kind, mapping = column_mapping
+            if (
+                mapping_kind != "iceberg-column-mapping"
+            ):  # pragma: no cover; only kind polars emits
+                raise NotImplementedError(f"Unhandled column mapping {mapping_kind!r}")
+            columns = tuple(
+                IcebergColumn.from_polars(spec) for spec in mapping.values()
+            )
+
+        position_deletes: dict[int, tuple[str, ...]] = {}
+        deletion_vectors: dict[int, str] = {}
+        delta_selections: dict[int, pl.Series] = {}
+        if file_options.deletion_files is not None:
+            deletion_kind, deletion_payload = file_options.deletion_files
+            if deletion_kind == "iceberg":
+                raw_position_deletes, raw_deletion_vectors = deletion_payload
+                position_deletes = {
+                    index: tuple(delete_files)
+                    for index, delete_files in raw_position_deletes.items()
+                }
+                deletion_vectors = dict(raw_deletion_vectors)
+            elif deletion_kind == "delta-deletion-vector":
+                frame = deletion_payload(pl.DataFrame({"path": list(paths)}))
+                if (
+                    frame is None
+                ):  # pragma: no cover; the polars callback returns a frame
+                    delta_selections = {}
+                else:
+                    delta_selections = {
+                        index: selection
+                        for index, selection in enumerate(
+                            frame.get_column("selection_vector")
+                        )
+                        if selection is not None
+                    }
+            else:
+                raise NotImplementedError(  # pragma: no cover; only kinds polars emits
+                    f"Unhandled deletion files {deletion_kind!r}"
+                )
+
+        partition_values: dict[int, pl.Series] = {}
+        initial_defaults: dict[int, pl.Series] = {}
+        if file_options.default_values is not None:
+            defaults_kind, defaults_payload = file_options.default_values
+            if defaults_kind != "iceberg":  # pragma: no cover; only kind polars emits
+                raise NotImplementedError(f"Unhandled default values {defaults_kind!r}")
+            partition_fields, raw_initial_defaults = defaults_payload
+            for physical_id, value in partition_fields.items():
+                if isinstance(value, str):
+                    raise NotImplementedError(
+                        f"Iceberg partition field {physical_id}: {value}"
+                    )
+                partition_values[physical_id] = pl.Series._from_pyseries(value)
+            initial_defaults = {
+                physical_id: pl.Series._from_pyseries(value)
+                for physical_id, value in raw_initial_defaults.items()
+            }
         if (
             columns is None
             and not position_deletes
@@ -298,11 +350,21 @@ class LakeScanOptions:
         )
 
 
+def _series_mapping_eq(
+    left: Mapping[int, pl.Series], right: Mapping[int, pl.Series]
+) -> bool:
+    return left.keys() == right.keys() and all(
+        left_series.equals(right_series)
+        for left_series, right_series in zip(left.values(), right.values(), strict=True)
+    )
+
+
 def read_lake_files(
     paths: Sequence[str],
     lake_options: LakeScanOptions,
     schema: Schema,
     with_columns: Sequence[str] | None,
+    cached_parquet_info: Sequence[CachedParquetInfo] | None = None,
     *,
     stream: Stream,
 ) -> tuple[DataFrame, list[int]]:
@@ -331,6 +393,9 @@ def read_lake_files(
         Schema the scan must produce.
     with_columns
         Columns to project, or ``None`` for all of them.
+    cached_parquet_info
+        Footers already read for ``paths``, in the same order, or ``None`` to
+        read them here.
     stream
         CUDA stream used for device memory operations and kernel launches.
 
@@ -342,18 +407,26 @@ def read_lake_files(
     projected = [
         name for name in schema if with_columns is None or name in with_columns
     ]
-    wanted: dict[Any, _Wanted]
+    wanted: dict[Any, str]
     if lake_options.columns is not None:
         wanted = {
-            column.physical_id: _Wanted(column.name, column.physical_id)
+            column.physical_id: column.name
             for column in lake_options.columns
             if column.name in projected
             and column.physical_id not in lake_options.partition_values
         }
     else:
-        wanted = {name: _Wanted(name, None) for name in projected}
+        wanted = {name: name for name in projected}
 
-    footers = [_footer(path, by_field_id=by_field_id) for path in paths]
+    metadatas: Sequence[plc.io.parquet_metadata.FileMetaData | None] = (
+        [None] * len(paths)
+        if cached_parquet_info is None
+        else [info.file_metadata for info in cached_parquet_info]
+    )
+    footers = [
+        _footer(path, metadata, by_field_id=by_field_id)
+        for path, metadata in zip(paths, metadatas, strict=True)
+    ]
     rows_per_path = [footer.num_rows for footer in footers]
 
     frames: list[DataFrame] = []
@@ -398,14 +471,6 @@ def read_lake_files(
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _Wanted:
-    """A column of the table schema, and the Iceberg field ID it has if any."""
-
-    name: str
-    physical_id: int | None
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
 class _Footer:
     """What the parquet footer of one data file says about its columns."""
 
@@ -418,11 +483,17 @@ class _Footer:
         return dict(zip(self.names, self.keys, strict=True))[name]
 
 
-def _footer(path: str, *, by_field_id: bool) -> _Footer:
+def _footer(
+    path: str,
+    metadata: plc.io.parquet_metadata.FileMetaData | None,
+    *,
+    by_field_id: bool,
+) -> _Footer:
     """Top-level columns and row count of a parquet file."""
-    metadata = plc.io.parquet_metadata.read_parquet_footers(plc.io.SourceInfo([path]))[
-        0
-    ]
+    if metadata is None:
+        metadata = plc.io.parquet_metadata.read_parquet_footers(
+            plc.io.SourceInfo([path])
+        )[0]
     elements = iter(metadata.schema)
     root = next(elements)
     names = []
@@ -450,7 +521,7 @@ def _read_group(
     present: Sequence[Any],
     footer: _Footer,
     num_rows: int,
-    wanted: Mapping[Any, _Wanted],
+    wanted: Mapping[Any, str],
     schema: Schema,
     lake_options: LakeScanOptions,
     *,
@@ -479,123 +550,32 @@ def _read_group(
         }
 
     columns = []
-    for key, column in wanted.items():
-        dtype = schema[column.name]
+    for key, name in wanted.items():
+        dtype = schema[name]
         if key in read:
             columns.append(
-                Column(read[key], name=column.name, dtype=dtype).astype(dtype, stream)
+                Column(read[key], name=name, dtype=dtype).astype(dtype, stream)
             )
         elif lake_options.missing_columns_policy == "raise":
-            raise RuntimeError(f"column {column.name!r} is missing from a data file")
+            raise RuntimeError(f"column {name!r} is missing from a data file")
         else:
-            columns.append(
-                _fill_column(column, dtype, num_rows, lake_options, stream=stream)
-            )
+            default = lake_options.initial_defaults.get(key) if by_field_id else None
+            if default is None:
+                obj = plc.Column.from_scalar(
+                    plc.Scalar.from_py(None, dtype.plc_type, stream=stream),
+                    num_rows,
+                    stream=stream,
+                )
+                columns.append(Column(obj, name=name, dtype=dtype))
+            else:
+                (obj,) = plc.filling.repeat(
+                    plc.Table([plc.Column.from_arrow(default, stream=stream)]),
+                    num_rows,
+                    stream=stream,
+                ).columns()
+                columns.append(
+                    Column(obj, name=name, dtype=dtype).astype(dtype, stream)
+                )
     if not columns:
         return DataFrame([], num_rows=num_rows, stream=stream)
     return DataFrame(columns, stream=stream)
-
-
-def _fill_column(
-    column: _Wanted,
-    dtype: Any,
-    num_rows: int,
-    lake_options: LakeScanOptions,
-    *,
-    stream: Stream,
-) -> Column:
-    """Materialize a column absent from a data file."""
-    default = (
-        None
-        if column.physical_id is None
-        else lake_options.initial_defaults.get(column.physical_id)
-    )
-    if default is None:
-        obj = plc.Column.from_scalar(
-            plc.Scalar.from_py(None, dtype.plc_type, stream=stream),
-            num_rows,
-            stream=stream,
-        )
-        return Column(obj, name=column.name, dtype=dtype)
-    (obj,) = plc.filling.repeat(
-        plc.Table([plc.Column.from_arrow(default, stream=stream)]),
-        num_rows,
-        stream=stream,
-    ).columns()
-    return Column(obj, name=column.name, dtype=dtype).astype(dtype, stream)
-
-
-def _series_mapping_eq(
-    left: Mapping[int, pl.Series], right: Mapping[int, pl.Series]
-) -> bool:
-    return left.keys() == right.keys() and all(
-        left[key].equals(right[key]) for key in left
-    )
-
-
-def _parse_column_mapping(
-    column_mapping: tuple[str, dict[int, Any]] | None,
-) -> tuple[IcebergColumn, ...] | None:
-    if column_mapping is None:
-        return None
-    kind, mapping = column_mapping
-    if kind != "iceberg-column-mapping":  # pragma: no cover; only kind polars emits
-        raise NotImplementedError(f"Unhandled column mapping {kind!r}")
-    return tuple(IcebergColumn.from_polars(spec) for spec in mapping.values())
-
-
-def _parse_deletion_files(
-    deletion_files: tuple[str, Any] | None, paths: Sequence[str]
-) -> tuple[dict[int, tuple[str, ...]], dict[int, str], dict[int, pl.Series]]:
-    if deletion_files is None:
-        return {}, {}, {}
-    kind, payload = deletion_files
-    if kind == "iceberg":
-        position_deletes, deletion_vectors = payload
-        return (
-            {
-                index: tuple(delete_files)
-                for index, delete_files in position_deletes.items()
-            },
-            dict(deletion_vectors),
-            {},
-        )
-    if kind == "delta-deletion-vector":
-        frame = payload(pl.DataFrame({"path": list(paths)}))
-        if frame is None:  # pragma: no cover; the polars callback returns a frame
-            return {}, {}, {}
-        return (
-            {},
-            {},
-            {
-                index: selection
-                for index, selection in enumerate(frame.get_column("selection_vector"))
-                if selection is not None
-            },
-        )
-    raise NotImplementedError(  # pragma: no cover; only kinds polars emits
-        f"Unhandled deletion files {kind!r}"
-    )
-
-
-def _parse_default_values(
-    default_values: tuple[str, Any] | None,
-) -> tuple[dict[int, pl.Series], dict[int, pl.Series]]:
-    if default_values is None:
-        return {}, {}
-    kind, payload = default_values
-    if kind != "iceberg":  # pragma: no cover; only kind polars emits
-        raise NotImplementedError(f"Unhandled default values {kind!r}")
-    partition_fields, initial_defaults = payload
-    partition_values = {}
-    for physical_id, value in partition_fields.items():
-        if isinstance(value, str):
-            raise NotImplementedError(f"Iceberg partition field {physical_id}: {value}")
-        partition_values[physical_id] = pl.Series._from_pyseries(value)
-    return (
-        partition_values,
-        {
-            physical_id: pl.Series._from_pyseries(value)
-            for physical_id, value in initial_defaults.items()
-        },
-    )
