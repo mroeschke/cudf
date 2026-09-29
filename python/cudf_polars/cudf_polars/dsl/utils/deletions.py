@@ -52,52 +52,69 @@ def deletion_mask(
     Boolean column that is true for the rows to keep, or ``None`` when
     nothing is deleted.
     """
-    masks = []
-    deleted = False
+    positions: list[plc.Column] = []
     puffin_cache: dict[str, dict[str, pa.ChunkedArray]] = {}
+    offset = 0
     for index, (path, num_rows) in enumerate(zip(paths, rows_per_path, strict=True)):
         selection = lake_options.delta_selections.get(index)
         if selection is None:
-            positions = _iceberg_positions(
+            file_positions = _iceberg_positions(
                 index, path, lake_options, puffin_cache, stream=stream
             )
-            mask = (
+            if file_positions is not None:
+                positions.append(
+                    file_positions
+                    if offset == 0
+                    else plc.binaryop.binary_operation(
+                        file_positions,
+                        plc.Scalar.from_py(
+                            offset, plc.DataType(plc.TypeId.INT64), stream=stream
+                        ),
+                        plc.binaryop.BinaryOperator.ADD,
+                        plc.DataType(plc.TypeId.INT64),
+                        stream=stream,
+                    )
+                )
+        else:
+            deleted = (
+                selection.fill_null(value=False).not_().arg_true().cast(pl.Int64)
+                + offset
+            )
+            positions.append(plc.Column.from_arrow(deleted.to_arrow(), stream=stream))
+        offset += num_rows
+    if not positions:
+        return None
+    (mask,) = plc.copying.scatter(
+        [
+            plc.Scalar.from_py(
+                False,  # noqa: FBT003
+                plc.DataType(plc.TypeId.BOOL8),
+                stream=stream,
+            )
+        ],
+        plc.unary.cast(
+            positions[0]
+            if len(positions) == 1
+            else plc.concatenate.concatenate(positions, stream=stream),
+            plc.DataType(plc.types.SIZE_TYPE_ID),
+            stream=stream,
+        ),
+        plc.Table(
+            [
                 plc.Column.from_scalar(
                     plc.Scalar.from_py(
                         True,  # noqa: FBT003
                         plc.DataType(plc.TypeId.BOOL8),
                         stream=stream,
                     ),
-                    num_rows,
+                    offset,
                     stream=stream,
                 )
-                if positions is None
-                else _mask_from_positions(positions, num_rows, stream=stream)
-            )
-            deleted |= positions is not None
-        else:
-            mask = plc.Column.from_arrow(selection.to_arrow(), stream=stream)
-            if mask.size() < num_rows:
-                padding = plc.Column.from_scalar(
-                    plc.Scalar.from_py(
-                        True,  # noqa: FBT003
-                        plc.DataType(plc.TypeId.BOOL8),
-                        stream=stream,
-                    ),
-                    num_rows - mask.size(),
-                    stream=stream,
-                )
-                mask = plc.concatenate.concatenate([mask, padding], stream=stream)
-            deleted = True
-        masks.append(mask)
-    if not deleted:
-        return None
-    return Column(
-        plc.concatenate.concatenate(masks, stream=stream)
-        if len(masks) > 1
-        else masks[0],
-        dtype=DataType(pl.Boolean()),
-    )
+            ]
+        ),
+        stream=stream,
+    ).columns()
+    return Column(mask, dtype=DataType(pl.Boolean()))
 
 
 def apply_deletions(
@@ -140,40 +157,6 @@ def apply_deletions(
     return df.filter(mask)
 
 
-def _mask_from_positions(
-    positions: plc.Column, num_rows: int, *, stream: Stream
-) -> plc.Column:
-    """Turn deleted row positions into a keep-mask of ``num_rows`` rows."""
-    positions = plc.unary.cast(
-        positions, plc.DataType(plc.types.SIZE_TYPE_ID), stream=stream
-    )
-    (mask,) = plc.copying.scatter(
-        [
-            plc.Scalar.from_py(
-                False,  # noqa: FBT003
-                plc.DataType(plc.TypeId.BOOL8),
-                stream=stream,
-            )
-        ],
-        positions,
-        plc.Table(
-            [
-                plc.Column.from_scalar(
-                    plc.Scalar.from_py(
-                        True,  # noqa: FBT003
-                        plc.DataType(plc.TypeId.BOOL8),
-                        stream=stream,
-                    ),
-                    num_rows,
-                    stream=stream,
-                )
-            ]
-        ),
-        stream=stream,
-    ).columns()
-    return mask
-
-
 def _iceberg_positions(
     index: int,
     path: str,
@@ -208,4 +191,4 @@ def _iceberg_positions(
     vector = puffin_cache[puffin].get(path)
     if vector is None:  # pragma: no cover; polars keys on the scan path
         return None
-    return plc.Column.from_arrow(vector, stream=stream)
+    return plc.Column.from_arrow(vector.cast("int64"), stream=stream)

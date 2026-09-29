@@ -19,7 +19,7 @@ from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.replace import replace
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from rmm.pylibrmm.stream import Stream
 
@@ -120,6 +120,9 @@ class LakeScanOptions:
     row_count
         ``(total_rows, deleted_rows)`` for the whole scan when the table
         metadata could supply it.
+    expected_columns
+        Names a data file may hold when ``extra_columns_policy`` is
+        ``"raise"``, or ``None`` to allow any.
     """
 
     columns: tuple[IcebergColumn, ...] | None
@@ -132,10 +135,13 @@ class LakeScanOptions:
     extra_columns_policy: str
     cast_columns_policy: Mapping[str, Any]
     row_count: tuple[int, int] | None
+    expected_columns: frozenset[str] | None = None
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.columns is not None and any(column.children for column in self.columns):
             raise NotImplementedError("Iceberg column mapping of nested columns")
+        if self.partition_values and self.columns is None:
+            raise NotImplementedError("Iceberg partition values without column mapping")
         if self.extra_columns_policy not in ("ignore", "raise"):
             raise NotImplementedError(  # pragma: no cover; only two policies exist
                 f"Extra columns policy {self.extra_columns_policy!r}"
@@ -271,6 +277,38 @@ class LakeScanOptions:
             row_count=file_options.row_count,
         )
 
+    def expect_columns(
+        self,
+        reader_schema: Mapping[str, Any] | None,
+        first_path: str,
+        hive_names: Iterable[str],
+    ) -> LakeScanOptions:
+        """
+        Record the names a data file may hold.
+
+        Parameters
+        ----------
+        reader_schema
+            Schema given to the scan, as polars serializes it, or ``None``
+            when the scan infers its schema from the first file.
+        first_path
+            First data file of the scan.
+        hive_names
+            Names of the hive partition columns, which a file may also hold.
+
+        Returns
+        -------
+        Options whose ``expected_columns`` are set.
+        """
+        names = (
+            reader_schema["fields"]
+            if reader_schema is not None
+            else _footer(first_path, None, by_field_id=False).names
+        )
+        return dataclasses.replace(
+            self, expected_columns=frozenset(names).union(hive_names)
+        )
+
     @property
     def has_deletions(self) -> bool:
         """Whether any rows have to be dropped after reading."""
@@ -334,6 +372,7 @@ class LakeScanOptions:
                 self.missing_columns_policy,
                 self.extra_columns_policy,
                 self.row_count,
+                self.expected_columns,
             )
         )
 
@@ -351,6 +390,7 @@ class LakeScanOptions:
             and self.extra_columns_policy == other.extra_columns_policy
             and self.cast_columns_policy == other.cast_columns_policy
             and self.row_count == other.row_count
+            and self.expected_columns == other.expected_columns
         )
 
 
@@ -434,6 +474,17 @@ def read_lake_files(
         for path, metadata in zip(paths, metadatas, strict=True)
     ]
     rows_per_path = [footer.num_rows for footer in footers]
+    if lake_options.expected_columns is not None:
+        for footer in footers:
+            extra = [
+                name
+                for name in footer.names
+                if name not in lake_options.expected_columns
+            ]
+            if extra:
+                raise pl.exceptions.SchemaError(
+                    f"extra column in file outside of expected schema: {extra[0]}"
+                )
 
     predicate_columns = (
         {
@@ -714,7 +765,7 @@ def _read_group(
     if present:
         builder = plc.io.parquet.ParquetReaderOptions.builder(
             plc.io.SourceInfo(list(paths))
-        )
+        ).allow_mismatched_pq_schemas(val=True)
         if by_field_id:
             builder = builder.column_field_ids(list(present))
         options = builder.build()
@@ -779,7 +830,7 @@ def _read_group(
                 Column(read[key], name=name, dtype=dtype).astype(dtype, stream)
             )
         elif lake_options.missing_columns_policy == "raise":
-            raise RuntimeError(f"column {name!r} is missing from a data file")
+            raise pl.exceptions.ColumnNotFoundError(f"did not find column {name}")
         else:
             default = lake_options.initial_defaults.get(key) if by_field_id else None
             if default is None:

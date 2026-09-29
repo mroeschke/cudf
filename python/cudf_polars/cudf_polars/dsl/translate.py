@@ -538,12 +538,18 @@ def _(node: plrs._ir_nodes.Scan, translator: Translator, schema: Schema) -> ir.I
     with_columns = file_options.with_columns
     row_index = file_options.row_index
     include_file_paths = file_options.include_file_paths
-    lake_options = LakeScanOptions.from_file_options(file_options, node.paths)
     hive_parts = (
         None
         if POLARS_VERSION_LT_142 or node.hive_parts is None
         else PerPathValues.from_polars(pl.DataFrame._from_pydf(node.hive_parts))
     )
+    lake_options = LakeScanOptions.from_file_options(file_options, node.paths)
+    if lake_options is not None and lake_options.extra_columns_policy == "raise":
+        lake_options = lake_options.expect_columns(
+            reader_options.get("schema"),
+            paths[0],
+            hive_parts.names if hive_parts is not None else (),
+        )
     config_options = translator.config_options
     parquet_options = config_options.parquet_options
 

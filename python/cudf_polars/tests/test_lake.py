@@ -2,15 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import polars as pl
 
-import pylibcudf as plc
-
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import (
+    assert_gpu_result_equal,
+    assert_ir_translation_raises,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -18,7 +22,6 @@ if TYPE_CHECKING:
 
 pytest.importorskip("pyiceberg")
 deltalake = pytest.importorskip("deltalake")
-
 import pyiceberg.schema  # noqa: E402
 from pyiceberg.catalog.sql import SqlCatalog  # noqa: E402
 from pyiceberg.partitioning import PartitionField, PartitionSpec  # noqa: E402
@@ -69,6 +72,24 @@ def evolved_iceberg(iceberg_catalog: SqlCatalog) -> str:
             "c": [1.5, 2.5],
         }
     ).sink_iceberg(tbl, mode="append", schema_mode="merge")
+    return tbl.metadata_location
+
+
+@pytest.fixture
+def renamed_iceberg(iceberg_catalog: SqlCatalog) -> str:
+    first = pl.LazyFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    tbl = iceberg_catalog.create_table(
+        "ns.renamed", schema=first.collect_schema().to_arrow()
+    )
+    first.sink_iceberg(tbl, mode="append")
+
+    with tbl.update_schema() as update:
+        update.rename_column("b", "b_renamed")
+    tbl.refresh()
+
+    pl.LazyFrame({"a": [4, 5], "b_renamed": ["p", "q"]}).sink_iceberg(
+        tbl, mode="append"
+    )
     return tbl.metadata_location
 
 
@@ -142,105 +163,132 @@ def evolved_hive(tmp_path: Path) -> Path:
     return path
 
 
-@pytest.fixture
-def read_parquet_rows(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    read_parquet = plc.io.parquet.read_parquet
-    rows: list[int] = []
-
-    def counting_read_parquet(*args: Any, **kwargs: Any) -> Any:
-        result = read_parquet(*args, **kwargs)
-        rows.append(result.tbl.num_rows())
-        return result
-
-    monkeypatch.setattr(plc.io.parquet, "read_parquet", counting_read_parquet)
-    return rows
-
-
-IN_MEMORY_ENGINE = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
-
-
-def test_scan_iceberg(engine: pl.GPUEngine, flat_iceberg: str) -> None:
-    assert_gpu_result_equal(pl.scan_iceberg(flat_iceberg).sort("a"), engine=engine)
-
-
-def test_scan_delta(engine: pl.GPUEngine, flat_delta: str) -> None:
-    assert_gpu_result_equal(pl.scan_delta(flat_delta).sort("a"), engine=engine)
-
-
-def test_scan_iceberg_schema_evolution(
-    engine: pl.GPUEngine, evolved_iceberg: str
-) -> None:
-    assert_gpu_result_equal(pl.scan_iceberg(evolved_iceberg).sort("a"), engine=engine)
-
-
 @pytest.mark.parametrize(
-    "columns", [["a"], ["b_renamed"], ["c"], ["c", "a"], ["a", "b_renamed", "c"]]
-)
-def test_scan_iceberg_schema_evolution_projection(
-    engine: pl.GPUEngine, evolved_iceberg: str, columns: list[str]
-) -> None:
-    assert_gpu_result_equal(
-        pl.scan_iceberg(evolved_iceberg).select(columns).sort(columns),
-        engine=engine,
-    )
-
-
-@pytest.mark.parametrize(
-    "predicate",
+    "table",
     [
-        pl.col("a") > 2,
-        pl.col("b_renamed") == "y",
-        pl.col("b_renamed").is_in(["x", "q"]),
-        pl.col("c") > 2.0,
-        pl.col("c").is_null(),
-        (pl.col("b_renamed") != "x") & (pl.col("a") < 5),
-        (pl.col("a") > 1) | (pl.col("c") > 2.0),
+        "flat_iceberg",
+        "flat_delta",
+        "evolved_iceberg",
+        "renamed_iceberg",
+        "partitioned_iceberg",
+        "partitioned_delta",
+        "deleted_rows_delta",
     ],
 )
-def test_scan_iceberg_schema_evolution_predicate(
-    engine: pl.GPUEngine, evolved_iceberg: str, predicate: pl.Expr
+def test_scan_lake(
+    request: pytest.FixtureRequest, engine: pl.GPUEngine, table: str
 ) -> None:
-    assert_gpu_result_equal(
-        pl.scan_iceberg(evolved_iceberg).filter(predicate).sort("a"),
-        engine=engine,
-    )
+    scan = pl.scan_iceberg if table.endswith("iceberg") else pl.scan_delta
+    q = scan(request.getfixturevalue(table))
+    assert_gpu_result_equal(q.sort("a"), engine=engine)
+
+
+FLAT_PREDICATES = [
+    pl.col("a") < 3,
+    pl.col("b") == "q",
+    (pl.col("a") > 1) & (pl.col("b") != "y"),
+    pl.col("a").is_between(2, 4),
+]
+EVOLVED_PREDICATES = [
+    pl.col("a") > 2,
+    pl.col("b_renamed") == "y",
+    pl.col("b_renamed").is_in(["x", "q"]),
+    pl.col("c") > 2.0,
+    pl.col("c").is_null(),
+    (pl.col("b_renamed") != "x") & (pl.col("a") < 5),
+    (pl.col("a") > 1) | (pl.col("c") > 2.0),
+]
+PARTITIONED_PREDICATES = [
+    pl.col("a") > 1,
+    pl.col("a").is_in([2, 3, 6]),
+    pl.col("part") == "v",
+    (pl.col("a") > 1) & (pl.col("part") == "v"),
+    (pl.col("a") == 1) | (pl.col("part") == "v"),
+]
 
 
 @pytest.mark.parametrize(
-    "predicate",
+    "table, predicate",
     [
-        pl.col("a") < 3,
-        pl.col("b") == "q",
-        (pl.col("a") > 1) & (pl.col("b") != "y"),
-        pl.col("a").is_between(2, 4),
+        *(
+            (table, p)
+            for table in ("flat_iceberg", "flat_delta")
+            for p in FLAT_PREDICATES
+        ),
+        *(("evolved_iceberg", p) for p in EVOLVED_PREDICATES),
+        ("renamed_iceberg", pl.col("b_renamed") != "y"),
+        *(
+            (table, p)
+            for table in ("partitioned_iceberg", "partitioned_delta")
+            for p in PARTITIONED_PREDICATES
+        ),
+        ("deleted_rows_delta", pl.col("a") > 4),
     ],
 )
-@pytest.mark.parametrize("scan", ["iceberg", "delta"])
 def test_scan_lake_predicate(
+    request: pytest.FixtureRequest,
     engine: pl.GPUEngine,
-    flat_iceberg: str,
-    flat_delta: str,
-    scan: str,
+    table: str,
     predicate: pl.Expr,
 ) -> None:
-    q = (
-        pl.scan_iceberg(flat_iceberg)
-        if scan == "iceberg"
-        else pl.scan_delta(flat_delta)
-    )
+    scan = pl.scan_iceberg if table.endswith("iceberg") else pl.scan_delta
+    q = scan(request.getfixturevalue(table))
     assert_gpu_result_equal(q.filter(predicate).sort("a"), engine=engine)
 
 
 @pytest.mark.parametrize(
-    "query, rows_read",
+    "query",
     [
-        (lambda q: q.filter(pl.col("a") < 3), 3),
-        (lambda q: q.filter(pl.col("b_renamed") == "y"), 1),
-        (lambda q: q.filter(pl.col("c") > 2.0), 4),
-        (lambda q: q.filter(pl.col("b_renamed") == "y").with_row_index("idx"), 1),
-        (lambda q: q.filter(pl.col("b_renamed") == "y").head(1), 1),
-        (lambda q: q.with_row_index("idx").filter(pl.col("b_renamed") == "y"), 5),
-        (lambda q: q.head(4).filter(pl.col("b_renamed") == "y"), 5),
+        *(
+            lambda q, columns=columns: q.select(columns).sort(columns)
+            for columns in (
+                ["a"],
+                ["b_renamed"],
+                ["c"],
+                ["c", "a"],
+                ["a", "b_renamed", "c"],
+            )
+        ),
+        *(lambda q, n=n: q.sort("a").head(n) for n in (1, 3, 5)),
+        lambda q: q.with_row_index("idx"),
+    ],
+    ids=[
+        "select_a",
+        "select_b_renamed",
+        "select_c",
+        "select_c_a",
+        "select_all",
+        "head_1",
+        "head_3",
+        "head_5",
+        "row_index",
+    ],
+)
+def test_scan_iceberg_schema_evolution(
+    engine: pl.GPUEngine, evolved_iceberg: str, query: Any
+) -> None:
+    assert_gpu_result_equal(query(pl.scan_iceberg(evolved_iceberg)), engine=engine)
+
+
+@pytest.mark.parametrize(
+    "table, query",
+    [
+        ("evolved_iceberg", lambda q: q.filter(pl.col("a") < 3)),
+        ("evolved_iceberg", lambda q: q.filter(pl.col("b_renamed") == "y")),
+        ("evolved_iceberg", lambda q: q.filter(pl.col("c") > 2.0)),
+        (
+            "evolved_iceberg",
+            lambda q: q.filter(pl.col("b_renamed") == "y").with_row_index("idx"),
+        ),
+        ("evolved_iceberg", lambda q: q.filter(pl.col("b_renamed") == "y").head(1)),
+        (
+            "evolved_iceberg",
+            lambda q: q.with_row_index("idx").filter(pl.col("b_renamed") == "y"),
+        ),
+        ("evolved_iceberg", lambda q: q.head(4).filter(pl.col("b_renamed") == "y")),
+        ("renamed_iceberg", lambda q: q.filter(pl.col("b_renamed") == "y")),
+        ("partitioned_iceberg", lambda q: q.filter(pl.col("a").is_in([2, 3]))),
+        ("partitioned_delta", lambda q: q.filter(pl.col("a").is_in([2, 3]))),
     ],
     ids=[
         "widened",
@@ -250,66 +298,24 @@ def test_scan_lake_predicate(
         "filter_then_slice",
         "row_index_then_filter",
         "slice_then_filter",
+        "renamed_only",
+        "partitioned_iceberg",
+        "partitioned_delta",
     ],
 )
-def test_scan_iceberg_predicate_pushdown(
-    read_parquet_rows: list[int],
-    evolved_iceberg: str,
+def test_scan_lake_predicate_pushdown(
+    request: pytest.FixtureRequest,
+    in_memory_engine: pl.GPUEngine,
+    table: str,
     query: Any,
-    rows_read: int,
 ) -> None:
+    scan = pl.scan_iceberg if table.endswith("iceberg") else pl.scan_delta
+    q = scan(request.getfixturevalue(table))
     assert_gpu_result_equal(
-        query(pl.scan_iceberg(evolved_iceberg)),
-        engine=IN_MEMORY_ENGINE,
+        query(q),
+        engine=in_memory_engine,
         check_row_order=False,
     )
-    assert sum(read_parquet_rows) == rows_read
-
-
-@pytest.mark.parametrize(
-    "predicate",
-    [
-        pl.col("a") > 1,
-        pl.col("a").is_in([2, 3, 6]),
-        pl.col("part") == "v",
-        (pl.col("a") > 1) & (pl.col("part") == "v"),
-        (pl.col("a") == 1) | (pl.col("part") == "v"),
-    ],
-)
-@pytest.mark.parametrize("scan", ["iceberg", "delta"])
-def test_scan_lake_partitioned_predicate(
-    engine: pl.GPUEngine,
-    partitioned_iceberg: str,
-    partitioned_delta: str,
-    scan: str,
-    predicate: pl.Expr,
-) -> None:
-    q = (
-        pl.scan_iceberg(partitioned_iceberg)
-        if scan == "iceberg"
-        else pl.scan_delta(partitioned_delta)
-    )
-    assert_gpu_result_equal(q.filter(predicate).sort("a"), engine=engine)
-
-
-@pytest.mark.parametrize("scan", ["iceberg", "delta"])
-def test_scan_lake_partitioned_predicate_pushdown(
-    read_parquet_rows: list[int],
-    partitioned_iceberg: str,
-    partitioned_delta: str,
-    scan: str,
-) -> None:
-    q = (
-        pl.scan_iceberg(partitioned_iceberg)
-        if scan == "iceberg"
-        else pl.scan_delta(partitioned_delta)
-    )
-    assert_gpu_result_equal(
-        q.filter(pl.col("a").is_in([2, 3])),
-        engine=IN_MEMORY_ENGINE,
-        check_row_order=False,
-    )
-    assert sum(read_parquet_rows) == 2
 
 
 @pytest.mark.parametrize(
@@ -335,132 +341,242 @@ def test_scan_lake_hive_file_paths_predicate(
     assert_gpu_result_equal(query(q), engine=engine, check_row_order=False)
 
 
-def test_scan_iceberg_identity_partition_predicate(
-    engine: pl.GPUEngine, partitioned_iceberg: str
+@pytest.fixture
+def extra_columns(tmp_path: Path) -> Path:
+    for name, frames in {
+        "later": [{"a": [1, 2]}, {"a": [3], "c": [9]}],
+        "first": [{"a": [1, 2], "c": [9, 9]}, {"a": [3]}],
+    }.items():
+        for index, frame in enumerate(frames):
+            pl.LazyFrame(frame).sink_parquet(
+                tmp_path / name / f"{index}.parquet", mkdir=True
+            )
+    pl.LazyFrame({"a": [1]}).sink_parquet(
+        tmp_path / "hive" / "p=1" / "0.parquet", mkdir=True
+    )
+    pl.LazyFrame({"a": [2], "p": [2]}).sink_parquet(
+        tmp_path / "hive" / "p=2" / "0.parquet", mkdir=True
+    )
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    "directory, kwargs, query",
+    [
+        ("first", {}, lambda q: q),
+        ("hive", {"hive_partitioning": True}, lambda q: q),
+    ],
+    ids=["first_file", "hive_column"],
+)
+def test_scan_lake_extra_columns_expected(
+    engine: pl.GPUEngine,
+    extra_columns: Path,
+    directory: str,
+    kwargs: dict[str, Any],
+    query: Any,
 ) -> None:
-    assert_gpu_result_equal(
-        pl.scan_iceberg(partitioned_iceberg)
-        .filter((pl.col("a") > 1) & (pl.col("part") == "v"))
-        .sort("a"),
-        engine=engine,
-    )
+    q = pl.scan_parquet(extra_columns / directory, missing_columns="insert", **kwargs)
+    assert_gpu_result_equal(query(q), engine=engine, check_row_order=False)
 
 
-def test_scan_delta_deleted_rows_predicate(
-    engine: pl.GPUEngine, deleted_rows_delta: str
+@pytest.mark.parametrize(
+    "directory, kwargs, query",
+    [
+        ("later", {}, lambda q: q),
+        ("later", {}, lambda q: q.select("a")),
+        ("later", {}, lambda q: q.filter(pl.col("a") > 1)),
+        ("first", {"schema": {"a": pl.Int64}}, lambda q: q),
+    ],
+    ids=["later_file", "projected", "filtered", "explicit_schema"],
+)
+def test_scan_lake_extra_columns_raise(
+    engine: pl.GPUEngine,
+    extra_columns: Path,
+    directory: str,
+    kwargs: dict[str, Any],
+    query: Any,
 ) -> None:
-    assert_gpu_result_equal(
-        pl.scan_delta(deleted_rows_delta).filter(pl.col("a") > 4).sort("a"),
-        engine=engine,
+    q = query(
+        pl.scan_parquet(
+            extra_columns / directory / "*.parquet", missing_columns="insert", **kwargs
+        )
     )
-
-
-@pytest.mark.parametrize("n_rows", [1, 3, 5])
-def test_scan_iceberg_schema_evolution_slice(
-    engine: pl.GPUEngine, evolved_iceberg: str, n_rows: int
-) -> None:
-    assert_gpu_result_equal(
-        pl.scan_iceberg(evolved_iceberg).sort("a").head(n_rows), engine=engine
-    )
-
-
-def test_scan_iceberg_identity_partition(
-    engine: pl.GPUEngine, partitioned_iceberg: str
-) -> None:
-    assert_gpu_result_equal(
-        pl.scan_iceberg(partitioned_iceberg).sort("a"), engine=engine
-    )
-
-
-def test_scan_iceberg_row_index(engine: pl.GPUEngine, evolved_iceberg: str) -> None:
-    assert_gpu_result_equal(
-        pl.scan_iceberg(evolved_iceberg).with_row_index("idx"), engine=engine
-    )
-
-
-def test_scan_delta_deleted_rows(engine: pl.GPUEngine, deleted_rows_delta: str) -> None:
-    assert_gpu_result_equal(pl.scan_delta(deleted_rows_delta).sort("a"), engine=engine)
-
-
-def test_scan_delta_deleted_rows_count(
-    engine: pl.GPUEngine, deleted_rows_delta: str
-) -> None:
-    assert_gpu_result_equal(
-        pl.scan_delta(deleted_rows_delta).select(pl.len()), engine=engine
-    )
+    with pytest.raises(pl.exceptions.SchemaError):
+        q.collect()
+    with pytest.raises(pl.exceptions.SchemaError):
+        q.collect(engine=engine)
 
 
 @pytest.fixture
-def position_deletes(tmp_path: Path) -> tuple[str, tuple[str, ...]]:
+def default_files(tmp_path: Path) -> tuple[list[str], pa.Schema]:
+    a = pa.field("a", pa.int64(), metadata={b"PARQUET:field_id": b"1"})
+    d = pa.field("d", pa.int64(), metadata={b"PARQUET:field_id": b"2"})
+    old = pa.schema([a])
+    new = pa.schema([a, d])
+    paths = [str(tmp_path / "0.parquet"), str(tmp_path / "1.parquet")]
+    pq.write_table(pa.table({"a": [1, 2]}, schema=old), paths[0])
+    pq.write_table(pa.table({"a": [3], "d": [30]}, schema=new), paths[1])
+    return paths, new
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        lambda q: q,
+        lambda q: q.filter(pl.col("d") > 5),
+        lambda q: q.select("d"),
+    ],
+    ids=["all", "filter", "select"],
+)
+def test_scan_iceberg_initial_defaults(
+    engine: pl.GPUEngine,
+    default_files: tuple[list[str], pa.Schema],
+    query: Any,
+) -> None:
+    paths, schema = default_files
+    q = pl.scan_parquet(
+        paths,
+        schema={"a": pl.Int64, "d": pl.Int64},
+        missing_columns="insert",
+        extra_columns="ignore",
+        _column_mapping=("iceberg-column-mapping", schema),
+        _default_values=("iceberg", ({}, {2: pl.Series([7], dtype=pl.Int64)})),
+    )
+    assert_gpu_result_equal(
+        query(q),
+        engine=engine,
+        check_row_order=False,
+    )
+
+
+def test_scan_lake_missing_columns_raise(
+    engine: pl.GPUEngine, default_files: tuple[list[str], pa.Schema]
+) -> None:
+    paths, schema = default_files
+    q = pl.scan_parquet(
+        paths,
+        schema={"a": pl.Int64, "d": pl.Int64},
+        missing_columns="raise",
+        extra_columns="ignore",
+        _column_mapping=("iceberg-column-mapping", schema),
+    )
+    with pytest.raises(pl.exceptions.ColumnNotFoundError):
+        q.collect()
+    with pytest.raises(pl.exceptions.ColumnNotFoundError):
+        q.collect(engine=engine)
+
+
+def test_scan_lake_partition_values_without_column_mapping(
+    in_memory_engine: pl.GPUEngine,
+    default_files: tuple[list[str], pa.Schema],
+) -> None:
+    paths, _ = default_files
+    q = pl.scan_parquet(
+        paths,
+        _default_values=("iceberg", ({1: pl.Series([1, 2])}, {})),
+    )
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+def _puffin(deleted: dict[str, list[int]]) -> bytes:
+    # pyroaring a dependency of pyiceberg
+    # Could be removed once https://github.com/apache/iceberg-python/issues/1551
+    # is addressed.
+    pyroaring = pytest.importorskip("pyroaring")
+    magic = b"PFA1"
+    body = bytearray(magic)
+    blobs = []
+    for data_file, positions in deleted.items():
+        payload = (
+            bytes.fromhex("d1d33964")
+            + (1).to_bytes(8, "little")
+            + (0).to_bytes(4, "little")
+            + pyroaring.BitMap(positions).serialize()
+        )
+        blob = len(payload).to_bytes(4, "big") + payload + bytes(4)
+        blobs.append(
+            {
+                "type": "deletion-vector-v1",
+                "fields": [],
+                "snapshot-id": -1,
+                "sequence-number": -1,
+                "offset": len(body),
+                "length": len(blob),
+                "properties": {"referenced-data-file": data_file},
+            }
+        )
+        body += blob
+    footer = json.dumps({"blobs": blobs}).encode()
+    return bytes(
+        body + magic + footer + len(footer).to_bytes(4, "little") + bytes(4) + magic
+    )
+
+
+@pytest.fixture(params=["position_deletes", "deletion_vectors", "delta"])
+def deletion_files(request: pytest.FixtureRequest, tmp_path: Path) -> tuple[str, Any]:
     data = tmp_path / "data"
+    paths = []
     for index in range(3):
         path = data / f"part={index}" / "data.parquet"
         pl.LazyFrame({"a": [4 * index + i for i in range(4)]}).sink_parquet(
             path, mkdir=True
         )
-
-    deletes = tmp_path / "deletes"
-    paths = []
-    for index, positions in enumerate([[0, 3], [1]]):
-        path = deletes / f"{index}.parquet"
-        pl.LazyFrame({"file_path": [""] * len(positions), "pos": positions}).select(
-            "file_path", pl.col("pos").cast(pl.Int64)
-        ).sink_parquet(path, mkdir=True)
         paths.append(str(path))
-    return str(data), tuple(paths)
+    deleted = {0: [0, 3], 2: [1]}
+
+    if request.param == "position_deletes":
+        position_deletes = {}
+        for index, positions in deleted.items():
+            path = tmp_path / "deletes" / f"{index}.parquet"
+            pl.LazyFrame({"file_path": [paths[index]] * len(positions)}).with_columns(
+                pos=pl.Series(positions, dtype=pl.Int64)
+            ).sink_parquet(path, mkdir=True)
+            position_deletes[index] = [str(path)]
+        return str(data), ("iceberg", (position_deletes, {}))
+
+    if request.param == "deletion_vectors":
+        puffin = tmp_path / "deletes.puffin"
+        puffin.write_bytes(
+            _puffin({paths[index]: positions for index, positions in deleted.items()})
+        )
+        return str(data), ("iceberg", ({}, dict.fromkeys(deleted, str(puffin))))
+
+    selections = {
+        paths[index]: [i not in positions for i in range(max(positions) + 1)]
+        for index, positions in deleted.items()
+    }
+
+    def selection_vectors(requested: pl.DataFrame) -> pl.DataFrame:
+        return pl.DataFrame(
+            {"selection_vector": [selections.get(p) for p in requested["path"]]},
+            schema={"selection_vector": pl.List(pl.Boolean)},
+        )
+
+    return str(data), ("delta-deletion-vector", selection_vectors)
 
 
-def test_scan_position_deletes(
-    engine: pl.GPUEngine, position_deletes: tuple[str, tuple[str, ...]]
+@pytest.mark.parametrize(
+    "hive_partitioning, query",
+    [
+        (False, lambda q: q.sort("a")),
+        (False, lambda q: q.with_row_index("idx")),
+        (False, lambda q: q.select(pl.len())),
+        (True, lambda q: q.sort("a")),
+    ],
+    ids=["all", "row_index", "count", "hive"],
+)
+def test_scan_lake_deletions(
+    engine: pl.GPUEngine,
+    deletion_files: tuple[str, Any],
+    hive_partitioning: bool,  # noqa: FBT001
+    query: Any,
 ) -> None:
-    data, deletes = position_deletes
+    data, deletions = deletion_files
     assert_gpu_result_equal(
-        pl.scan_parquet(
-            data,
-            hive_partitioning=False,
-            _deletion_files=("iceberg", ({0: [deletes[0]], 2: [deletes[1]]}, {})),
-        ).sort("a"),
-        engine=engine,
-    )
-
-
-def test_scan_position_deletes_row_index(
-    engine: pl.GPUEngine, position_deletes: tuple[str, tuple[str, ...]]
-) -> None:
-    data, deletes = position_deletes
-    assert_gpu_result_equal(
-        pl.scan_parquet(
-            data,
-            hive_partitioning=False,
-            _deletion_files=("iceberg", ({0: [deletes[0]], 2: [deletes[1]]}, {})),
-        ).with_row_index("idx"),
-        engine=engine,
-    )
-
-
-def test_scan_position_deletes_hive(
-    engine: pl.GPUEngine, position_deletes: tuple[str, tuple[str, ...]]
-) -> None:
-    data, deletes = position_deletes
-    assert_gpu_result_equal(
-        pl.scan_parquet(
-            data,
-            hive_partitioning=True,
-            _deletion_files=("iceberg", ({0: [deletes[0]], 2: [deletes[1]]}, {})),
-        ).sort("a"),
-        engine=engine,
-    )
-
-
-def test_scan_position_deletes_count(
-    engine: pl.GPUEngine, position_deletes: tuple[str, tuple[str, ...]]
-) -> None:
-    data, deletes = position_deletes
-    assert_gpu_result_equal(
-        pl.scan_parquet(
-            data,
-            hive_partitioning=False,
-            _deletion_files=("iceberg", ({0: [deletes[0]], 2: [deletes[1]]}, {})),
-        ).select(pl.len()),
+        query(
+            pl.scan_parquet(
+                data, hive_partitioning=hive_partitioning, _deletion_files=deletions
+            )
+        ),
         engine=engine,
     )
