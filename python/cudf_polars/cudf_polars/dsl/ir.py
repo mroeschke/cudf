@@ -1192,6 +1192,9 @@ class Scan(IR):
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
         stream = context.get_cuda_stream()
+        # The predicate to apply after files are read.
+        # e.g. scan_parquet vs scan_delta/iceberg can apply the
+        # predicate differently to the read.
         effective_predicate = predicate
         if typ == "csv":
 
@@ -1325,15 +1328,29 @@ class Scan(IR):
                 name: schema[name] for name in output_names if name not in hive_names
             }
             Scan._validate_cached_parquet_info(paths, cached_parquet_info)
+            # Filter while reading only when every later step accepts filtered rows.
+            push_predicate = (
+                predicate is not None
+                and row_index is None
+                and skip_rows == 0
+                and n_rows == -1
+                and not lake_options.has_deletions
+                and not lake_options.partition_values
+                and hive_parts is None
+                and include_file_paths is None
+            )
             rows_per_path: list[int] | None
-            df, rows_per_path = read_lake_files(
+            df, rows_per_path, exact = read_lake_files(
                 paths,
                 lake_options,
                 file_schema,
                 with_columns,
                 cached_parquet_info,
+                predicate.value if push_predicate and predicate is not None else None,
                 stream=stream,
             )
+            if push_predicate and exact:
+                effective_predicate = None
             if lake_options.partition_values:
                 df = df.with_columns(
                     Scan._partition_lake_columns(

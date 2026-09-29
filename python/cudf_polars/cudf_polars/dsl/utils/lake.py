@@ -13,6 +13,10 @@ import polars as pl
 import pylibcudf as plc
 
 from cudf_polars.containers import Column, DataFrame
+from cudf_polars.dsl import expr
+from cudf_polars.dsl.to_ast import to_parquet_filter
+from cudf_polars.dsl.traversal import traversal
+from cudf_polars.dsl.utils.replace import replace
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -365,9 +369,10 @@ def read_lake_files(
     schema: Schema,
     with_columns: Sequence[str] | None,
     cached_parquet_info: Sequence[CachedParquetInfo] | None = None,
+    predicate: expr.Expr | None = None,
     *,
     stream: Stream,
-) -> tuple[DataFrame, list[int]]:
+) -> tuple[DataFrame, list[int], bool]:
     """
     Read the data files of an Iceberg or Delta scan onto the table schema.
 
@@ -396,12 +401,25 @@ def read_lake_files(
     cached_parquet_info
         Footers already read for ``paths``, in the same order, or ``None`` to
         read them here.
+    predicate
+        Predicate, in terms of the table schema, to filter the files with
+        while reading them, or ``None`` to read every row.
     stream
         CUDA stream used for device memory operations and kernel launches.
 
     Returns
     -------
-    The concatenated frame and the number of rows each path contributed.
+    The concatenated frame, the number of rows each path holds before
+    ``predicate`` is applied, and whether ``predicate`` was applied exactly.
+    When it was not, the rows read are a superset of the rows that satisfy
+    it and the caller must apply it again.
+
+    Notes
+    -----
+    The parquet reader filters on the names and types the file holds, so
+    the predicate is translated for each run of files. A part of it that
+    refers to a column the files lack, or hold with a type other than the
+    table type, is left for the caller.
     """
     by_field_id = lake_options.columns is not None
     projected = (
@@ -431,20 +449,45 @@ def read_lake_files(
     ]
     rows_per_path = [footer.num_rows for footer in footers]
 
+    predicate_columns = (
+        {
+            node.name: node
+            for node in traversal([predicate])
+            if isinstance(node, expr.Col)
+        }
+        if predicate is not None
+        else {}
+    )
     frames: list[DataFrame] = []
+    exact = True
     start = 0
     for keys, group in itertools.groupby(footers, key=lambda footer: footer.keys):
         stop = start + len(list(group))
         present = frozenset(keys)
+        read_keys = [key for key in wanted if key in present]
+        filters = None
+        if predicate is not None:
+            filters, group_exact = _group_filter(
+                predicate,
+                predicate_columns,
+                paths[start],
+                footers[start],
+                read_keys,
+                wanted,
+                schema,
+                stream=stream,
+            )
+            exact = exact and group_exact
         frames.append(
             _read_group(
                 paths[start:stop],
-                [key for key in wanted if key in present],
+                read_keys,
                 footers[start],
                 sum(rows_per_path[start:stop]),
                 wanted,
                 schema,
                 lake_options,
+                filters,
                 by_field_id=by_field_id,
                 stream=stream,
             )
@@ -452,10 +495,16 @@ def read_lake_files(
         start = stop
 
     if len(frames) == 1:
-        return frames[0], rows_per_path
+        return frames[0], rows_per_path, exact
     names = list(frames[0].column_map)
     if not names:
-        return DataFrame([], num_rows=sum(rows_per_path), stream=stream), rows_per_path
+        return (
+            DataFrame(
+                [], num_rows=sum(frame.num_rows for frame in frames), stream=stream
+            ),
+            rows_per_path,
+            exact,
+        )
     return (
         DataFrame.from_table(
             plc.concatenate.concatenate(
@@ -470,6 +519,7 @@ def read_lake_files(
             stream=stream,
         ),
         rows_per_path,
+        exact,
     )
 
 
@@ -515,6 +565,50 @@ def _footer(
     )
 
 
+def _group_filter(
+    predicate: expr.Expr,
+    predicate_columns: Mapping[str, expr.Col],
+    path: str,
+    footer: _Footer,
+    read_keys: Sequence[Any],
+    wanted: Mapping[Any, str],
+    schema: Schema,
+    *,
+    stream: Stream,
+) -> tuple[plc.expressions.Expression | None, bool]:
+    """Parquet filter for one run of same-shaped files and whether it is exact."""
+    name_by_key = dict(zip(footer.keys, footer.names, strict=True))
+    file_names = {
+        wanted[key]: name_by_key[key]
+        for key in read_keys
+        if wanted[key] in predicate_columns
+    }
+    file_types = (
+        plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo([path]))
+        .schema()
+        .column_types()
+        if file_names
+        else {}
+    )
+    readable = {
+        name: file_name
+        for name, file_name in file_names.items()
+        if file_types.get(file_name) == schema[name].plc_type
+    }
+    renames: dict[expr.Expr, expr.Expr] = {
+        predicate_columns[name]: expr.Col(predicate_columns[name].dtype, file_name)
+        for name, file_name in readable.items()
+        if file_name != name
+    }
+    (renamed,) = replace([predicate], renames)
+    filters, residual = to_parquet_filter(
+        renamed,
+        stream=stream,
+        unreadable_columns=frozenset(predicate_columns).difference(readable),
+    )
+    return filters, filters is not None and residual is None
+
+
 def _read_group(
     paths: Sequence[str],
     present: Sequence[Any],
@@ -523,6 +617,7 @@ def _read_group(
     wanted: Mapping[Any, str],
     schema: Schema,
     lake_options: LakeScanOptions,
+    filters: plc.expressions.Expression | None,
     *,
     by_field_id: bool,
     stream: Stream,
@@ -538,7 +633,10 @@ def _read_group(
         options = builder.build()
         if not by_field_id:
             options.set_column_names(list(present))
+        if filters is not None:
+            options.set_filter(filters)
         table = plc.io.parquet.read_parquet(options, stream=stream)
+        num_rows = table.tbl.num_rows()
         key_by_name = dict(zip(footer.names, footer.keys, strict=True))
         read = {
             key_by_name[name]: column

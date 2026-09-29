@@ -8,10 +8,13 @@ import pytest
 
 import polars as pl
 
+import pylibcudf as plc
+
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import Any
 
 pytest.importorskip("pyiceberg")
 deltalake = pytest.importorskip("deltalake")
@@ -137,11 +140,112 @@ def test_scan_iceberg_schema_evolution_projection(
     )
 
 
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("a") > 2,
+        pl.col("b_renamed") == "y",
+        pl.col("b_renamed").is_in(["x", "q"]),
+        pl.col("c") > 2.0,
+        pl.col("c").is_null(),
+        (pl.col("b_renamed") != "x") & (pl.col("a") < 5),
+        (pl.col("a") > 1) | (pl.col("c") > 2.0),
+    ],
+)
 def test_scan_iceberg_schema_evolution_predicate(
-    engine: pl.GPUEngine, evolved_iceberg: str
+    engine: pl.GPUEngine, evolved_iceberg: str, predicate: pl.Expr
 ) -> None:
     assert_gpu_result_equal(
-        pl.scan_iceberg(evolved_iceberg).filter(pl.col("a") > 2).sort("a"),
+        pl.scan_iceberg(evolved_iceberg).filter(predicate).sort("a"),
+        engine=engine,
+    )
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("a") < 3,
+        pl.col("b") == "q",
+        (pl.col("a") > 1) & (pl.col("b") != "y"),
+        pl.col("a").is_between(2, 4),
+    ],
+)
+@pytest.mark.parametrize("scan", ["iceberg", "delta"])
+def test_scan_lake_predicate(
+    engine: pl.GPUEngine,
+    flat_iceberg: str,
+    flat_delta: str,
+    scan: str,
+    predicate: pl.Expr,
+) -> None:
+    q = (
+        pl.scan_iceberg(flat_iceberg)
+        if scan == "iceberg"
+        else pl.scan_delta(flat_delta)
+    )
+    assert_gpu_result_equal(q.filter(predicate).sort("a"), engine=engine)
+
+
+@pytest.mark.parametrize(
+    "query, rows_read",
+    [
+        (lambda q: q.filter(pl.col("a") < 3), 3),
+        (lambda q: q.filter(pl.col("b_renamed") == "y"), 1),
+        (lambda q: q.filter(pl.col("c") > 2.0), 4),
+        (lambda q: q.filter(pl.col("b_renamed") == "y").with_row_index("idx"), 1),
+        (lambda q: q.filter(pl.col("b_renamed") == "y").head(1), 1),
+        (lambda q: q.with_row_index("idx").filter(pl.col("b_renamed") == "y"), 5),
+        (lambda q: q.head(4).filter(pl.col("b_renamed") == "y"), 5),
+    ],
+    ids=[
+        "widened",
+        "renamed",
+        "added",
+        "filter_then_row_index",
+        "filter_then_slice",
+        "row_index_then_filter",
+        "slice_then_filter",
+    ],
+)
+def test_scan_iceberg_predicate_pushdown(
+    monkeypatch: pytest.MonkeyPatch,
+    evolved_iceberg: str,
+    query: Any,
+    rows_read: int,
+) -> None:
+    read_parquet = plc.io.parquet.read_parquet
+    rows = []
+
+    def counting_read_parquet(*args: Any, **kwargs: Any) -> Any:
+        result = read_parquet(*args, **kwargs)
+        rows.append(result.tbl.num_rows())
+        return result
+
+    monkeypatch.setattr(plc.io.parquet, "read_parquet", counting_read_parquet)
+    assert_gpu_result_equal(
+        query(pl.scan_iceberg(evolved_iceberg)),
+        engine=pl.GPUEngine(executor="in-memory", raise_on_fail=True),
+        check_row_order=False,
+    )
+    assert sum(rows) == rows_read
+
+
+def test_scan_iceberg_identity_partition_predicate(
+    engine: pl.GPUEngine, partitioned_iceberg: str
+) -> None:
+    assert_gpu_result_equal(
+        pl.scan_iceberg(partitioned_iceberg)
+        .filter((pl.col("a") > 1) & (pl.col("part") == "v"))
+        .sort("a"),
+        engine=engine,
+    )
+
+
+def test_scan_delta_deleted_rows_predicate(
+    engine: pl.GPUEngine, deleted_rows_delta: str
+) -> None:
+    assert_gpu_result_equal(
+        pl.scan_delta(deleted_rows_delta).filter(pl.col("a") > 4).sort("a"),
         engine=engine,
     )
 

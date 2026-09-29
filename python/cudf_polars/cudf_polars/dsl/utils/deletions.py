@@ -205,7 +205,7 @@ def _iceberg_positions(
                 PuffinFile(Path(puffin).read_bytes())
             )
         }
-    positions = puffin_cache[puffin].get(path)
-    if positions is None:  # pragma: no cover; polars keys on the scan path
+    vector = puffin_cache[puffin].get(path)
+    if vector is None:  # pragma: no cover; polars keys on the scan path
         return None
-    return plc.Column.from_arrow(positions, stream=stream)
+    return plc.Column.from_arrow(vector, stream=stream)
