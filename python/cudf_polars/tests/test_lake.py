@@ -15,6 +15,7 @@ from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
     assert_ir_translation_raises,
 )
+from cudf_polars.testing.engine_utils import is_streaming_engine
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -403,8 +404,12 @@ def test_scan_lake_extra_columns_raise(
     )
     with pytest.raises(pl.exceptions.SchemaError):
         q.collect()
-    with pytest.raises(pl.exceptions.SchemaError):
-        q.collect(engine=engine)
+    if is_streaming_engine(engine):
+        with pytest.RaisesGroup(pl.exceptions.SchemaError, flatten_subgroups=True):
+            q.collect(engine=engine)
+    else:
+        with pytest.raises(pl.exceptions.SchemaError):
+            q.collect(engine=engine)
 
 
 @pytest.fixture
@@ -462,8 +467,14 @@ def test_scan_lake_missing_columns_raise(
     )
     with pytest.raises(pl.exceptions.ColumnNotFoundError):
         q.collect()
-    with pytest.raises(pl.exceptions.ColumnNotFoundError):
-        q.collect(engine=engine)
+    if is_streaming_engine(engine):
+        with pytest.RaisesGroup(
+            pl.exceptions.ColumnNotFoundError, flatten_subgroups=True
+        ):
+            q.collect(engine=engine)
+    else:
+        with pytest.raises(pl.exceptions.ColumnNotFoundError):
+            q.collect(engine=engine)
 
 
 def test_scan_lake_partition_values_without_column_mapping(
