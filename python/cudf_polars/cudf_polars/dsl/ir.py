@@ -910,10 +910,40 @@ class Scan(IR):
         schema: Schema,
         with_columns: list[str] | None,
         rows_per_path: list[int],
+        source_index: plc.Column | None,
         *,
         stream: Stream,
     ) -> list[Column]:
-        """Materialize the partition fields of an Iceberg scan."""
+        """
+        Materialize the partition fields of an Iceberg scan.
+
+        Parameters
+        ----------
+        lake_options
+            Options of the scan, holding one partition value per path for
+            each identity-partitioned field.
+        schema
+            Schema the scan must produce. Partition fields outside it are
+            skipped.
+        with_columns
+            Columns to project, or ``None`` for all of them. Partition fields
+            outside the projection are skipped.
+        rows_per_path
+            Number of rows read from each path, used to match rows to their
+            paths when ``source_index`` is ``None``.
+        source_index
+            Column giving the index of the path each row was read from, or
+            ``None`` to use ``rows_per_path``. Takes precedence over
+            ``rows_per_path``. The caller is responsible for ensuring that its
+            data is valid on ``stream``.
+        stream
+            CUDA stream used for device memory operations and kernel launches.
+
+        Returns
+        -------
+        One column per partition field in the schema and projection, aligned
+        with the rows read.
+        """
         assert lake_options.columns is not None
         names = {column.physical_id: column.name for column in lake_options.columns}
         frame = pl.DataFrame(
@@ -926,6 +956,8 @@ class Scan(IR):
         )
         if frame.width == 0:
             return []
+        if source_index is not None:
+            return PerPathValues(frame).gather(source_index, stream=stream)
         return PerPathValues(frame).repeat(rows_per_path, stream=stream)
 
     @staticmethod
@@ -1328,25 +1360,25 @@ class Scan(IR):
                 name: schema[name] for name in output_names if name not in hive_names
             }
             Scan._validate_cached_parquet_info(paths, cached_parquet_info)
-            # Filter while reading only when every later step accepts filtered rows.
+            # Cannot push predicate when later steps count rows before filtering.
             push_predicate = (
                 predicate is not None
                 and row_index is None
                 and skip_rows == 0
                 and n_rows == -1
                 and not lake_options.has_deletions
-                and not lake_options.partition_values
-                and hive_parts is None
-                and include_file_paths is None
             )
             rows_per_path: list[int] | None
-            df, rows_per_path, exact = read_lake_files(
+            df, rows_per_path, source_index, exact = read_lake_files(
                 paths,
                 lake_options,
                 file_schema,
                 with_columns,
                 cached_parquet_info,
                 predicate.value if push_predicate and predicate is not None else None,
+                with_source_index=bool(lake_options.partition_values)
+                or (hive_parts is not None and not hive_parts.is_uniform)
+                or include_file_paths is not None,
                 stream=stream,
             )
             if push_predicate and exact:
@@ -1358,17 +1390,26 @@ class Scan(IR):
                         file_schema,
                         with_columns,
                         rows_per_path,
+                        source_index,
                         stream=stream,
                     ),
                     stream=stream,
                 )
             if hive_parts is not None:
-                df = df.with_columns(
-                    hive_parts.repeat(rows_per_path, stream=stream), stream=stream
-                )
+                if source_index is not None:
+                    hive_columns = hive_parts.gather(source_index, stream=stream)
+                elif hive_parts.is_uniform:
+                    hive_columns = hive_parts.broadcast(df.num_rows, stream=stream)
+                else:
+                    hive_columns = hive_parts.repeat(rows_per_path, stream=stream)
+                df = df.with_columns(hive_columns, stream=stream)
             if include_file_paths is not None:
                 df = Scan.add_file_paths(
-                    include_file_paths, paths, df, rows_per_path=rows_per_path
+                    include_file_paths,
+                    paths,
+                    df,
+                    rows_per_path=rows_per_path,
+                    source_index=source_index,
                 )
             if lake_options.has_deletions:
                 df = apply_deletions(

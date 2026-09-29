@@ -114,6 +114,51 @@ def deleted_rows_delta(tmp_path: Path) -> str:
     return str(path)
 
 
+@pytest.fixture
+def partitioned_delta(tmp_path: Path) -> str:
+    path = tmp_path / "delta_partitioned"
+    pl.LazyFrame(
+        {"a": [1, 2, 3, 4, 5, 6], "part": ["u", "u", "v", "v", "w", "w"]}
+    ).sink_delta(
+        str(path),
+        mode="overwrite",
+        delta_write_options={"partition_by": ["part"]},
+    )
+    return str(path)
+
+
+@pytest.fixture
+def evolved_hive(tmp_path: Path) -> Path:
+    path = tmp_path / "hive"
+    pl.LazyFrame({"a": [1, 2], "b": [10, 20]}).sink_parquet(
+        path / "part=u" / "data.parquet", mkdir=True
+    )
+    pl.LazyFrame({"a": [3, 4]}).sink_parquet(
+        path / "part=v" / "data.parquet", mkdir=True
+    )
+    pl.LazyFrame({"a": [5, 6], "b": [50, 60]}).sink_parquet(
+        path / "part=w" / "data.parquet", mkdir=True
+    )
+    return path
+
+
+@pytest.fixture
+def read_parquet_rows(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    read_parquet = plc.io.parquet.read_parquet
+    rows: list[int] = []
+
+    def counting_read_parquet(*args: Any, **kwargs: Any) -> Any:
+        result = read_parquet(*args, **kwargs)
+        rows.append(result.tbl.num_rows())
+        return result
+
+    monkeypatch.setattr(plc.io.parquet, "read_parquet", counting_read_parquet)
+    return rows
+
+
+IN_MEMORY_ENGINE = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
+
+
 def test_scan_iceberg(engine: pl.GPUEngine, flat_iceberg: str) -> None:
     assert_gpu_result_equal(pl.scan_iceberg(flat_iceberg).sort("a"), engine=engine)
 
@@ -208,26 +253,86 @@ def test_scan_lake_predicate(
     ],
 )
 def test_scan_iceberg_predicate_pushdown(
-    monkeypatch: pytest.MonkeyPatch,
+    read_parquet_rows: list[int],
     evolved_iceberg: str,
     query: Any,
     rows_read: int,
 ) -> None:
-    read_parquet = plc.io.parquet.read_parquet
-    rows = []
-
-    def counting_read_parquet(*args: Any, **kwargs: Any) -> Any:
-        result = read_parquet(*args, **kwargs)
-        rows.append(result.tbl.num_rows())
-        return result
-
-    monkeypatch.setattr(plc.io.parquet, "read_parquet", counting_read_parquet)
     assert_gpu_result_equal(
         query(pl.scan_iceberg(evolved_iceberg)),
-        engine=pl.GPUEngine(executor="in-memory", raise_on_fail=True),
+        engine=IN_MEMORY_ENGINE,
         check_row_order=False,
     )
-    assert sum(rows) == rows_read
+    assert sum(read_parquet_rows) == rows_read
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("a") > 1,
+        pl.col("a").is_in([2, 3, 6]),
+        pl.col("part") == "v",
+        (pl.col("a") > 1) & (pl.col("part") == "v"),
+        (pl.col("a") == 1) | (pl.col("part") == "v"),
+    ],
+)
+@pytest.mark.parametrize("scan", ["iceberg", "delta"])
+def test_scan_lake_partitioned_predicate(
+    engine: pl.GPUEngine,
+    partitioned_iceberg: str,
+    partitioned_delta: str,
+    scan: str,
+    predicate: pl.Expr,
+) -> None:
+    q = (
+        pl.scan_iceberg(partitioned_iceberg)
+        if scan == "iceberg"
+        else pl.scan_delta(partitioned_delta)
+    )
+    assert_gpu_result_equal(q.filter(predicate).sort("a"), engine=engine)
+
+
+@pytest.mark.parametrize("scan", ["iceberg", "delta"])
+def test_scan_lake_partitioned_predicate_pushdown(
+    read_parquet_rows: list[int],
+    partitioned_iceberg: str,
+    partitioned_delta: str,
+    scan: str,
+) -> None:
+    q = (
+        pl.scan_iceberg(partitioned_iceberg)
+        if scan == "iceberg"
+        else pl.scan_delta(partitioned_delta)
+    )
+    assert_gpu_result_equal(
+        q.filter(pl.col("a").is_in([2, 3])),
+        engine=IN_MEMORY_ENGINE,
+        check_row_order=False,
+    )
+    assert sum(read_parquet_rows) == 2
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        lambda q: q.filter(pl.col("a") > 2),
+        lambda q: q.filter(pl.col("b") > 30),
+        lambda q: q.filter(pl.col("b") > 30).select("b", "path"),
+        lambda q: q.filter(pl.col("a").is_in([1, 4, 6])).select("part", "path"),
+        lambda q: q.filter((pl.col("a") < 5) & (pl.col("part") != "v")),
+    ],
+    ids=["data", "added", "added_only", "partition_only", "mixed"],
+)
+def test_scan_lake_hive_file_paths_predicate(
+    engine: pl.GPUEngine, evolved_hive: Path, query: Any
+) -> None:
+    q = pl.scan_parquet(
+        evolved_hive,
+        hive_partitioning=True,
+        missing_columns="insert",
+        include_file_paths="path",
+    )
+    assert_gpu_result_equal(query(q), engine=engine, check_row_order=False)
 
 
 def test_scan_iceberg_identity_partition_predicate(

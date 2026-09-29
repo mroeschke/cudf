@@ -371,22 +371,11 @@ def read_lake_files(
     cached_parquet_info: Sequence[CachedParquetInfo] | None = None,
     predicate: expr.Expr | None = None,
     *,
+    with_source_index: bool = False,
     stream: Stream,
-) -> tuple[DataFrame, list[int], bool]:
+) -> tuple[DataFrame, list[int], plc.Column | None, bool]:
     """
     Read the data files of an Iceberg or Delta scan onto the table schema.
-
-    The files of one table need not agree with each other or with the table
-    schema: a column can have been renamed, added or dropped since a file
-    was written. Iceberg tracks a column through all of that by the field ID
-    in the parquet footer, so the columns of an Iceberg file are matched on
-    that rather than on their name; Delta has no such ID and is matched on
-    name.
-
-    Files are read in runs that hold the same columns, since the parquet
-    reader requires every source of one read to agree. Each run is then
-    renamed and cast to the table schema, and columns the files do not hold
-    are filled in.
 
     Parameters
     ----------
@@ -404,22 +393,19 @@ def read_lake_files(
     predicate
         Predicate, in terms of the table schema, to filter the files with
         while reading them, or ``None`` to read every row.
+    with_source_index
+        Whether to return the index into ``paths`` of the file each row was
+        read from when ``predicate`` is given.
     stream
         CUDA stream used for device memory operations and kernel launches.
 
     Returns
     -------
-    The concatenated frame, the number of rows each path holds before
-    ``predicate`` is applied, and whether ``predicate`` was applied exactly.
-    When it was not, the rows read are a superset of the rows that satisfy
-    it and the caller must apply it again.
-
-    Notes
-    -----
-    The parquet reader filters on the names and types the file holds, so
-    the predicate is translated for each run of files. A part of it that
-    refers to a column the files lack, or hold with a type other than the
-    table type, is left for the caller.
+    tuple of:
+        - The concatenated frame.
+        - The number of rows each path holds before ``predicate`` is applied.
+        - The source index of each row, or ``None`` if ``with_source_index`` is ``False``.
+        - Whether ``predicate`` was applied exactly.
     """
     by_field_id = lake_options.columns is not None
     projected = (
@@ -458,7 +444,9 @@ def read_lake_files(
         if predicate is not None
         else {}
     )
+    track_source = predicate is not None and with_source_index
     frames: list[DataFrame] = []
+    source_indices: list[plc.Column] = []
     exact = True
     start = 0
     for keys, group in itertools.groupby(footers, key=lambda footer: footer.keys):
@@ -478,24 +466,33 @@ def read_lake_files(
                 stream=stream,
             )
             exact = exact and group_exact
-        frames.append(
-            _read_group(
-                paths[start:stop],
-                read_keys,
-                footers[start],
-                sum(rows_per_path[start:stop]),
-                wanted,
-                schema,
-                lake_options,
-                filters,
-                by_field_id=by_field_id,
-                stream=stream,
-            )
+        frame, source_index = _read_group(
+            paths[start:stop],
+            read_keys,
+            footers[start],
+            rows_per_path[start:stop],
+            wanted,
+            schema,
+            lake_options,
+            filters,
+            start if track_source else None,
+            by_field_id=by_field_id,
+            stream=stream,
         )
+        frames.append(frame)
+        if source_index is not None:
+            source_indices.append(source_index)
         start = stop
 
+    source_index = (
+        None
+        if not track_source
+        else source_indices[0]
+        if len(source_indices) == 1
+        else plc.concatenate.concatenate(source_indices, stream=stream)
+    )
     if len(frames) == 1:
-        return frames[0], rows_per_path, exact
+        return frames[0], rows_per_path, source_index, exact
     names = list(frames[0].column_map)
     if not names:
         return (
@@ -503,6 +500,7 @@ def read_lake_files(
                 [], num_rows=sum(frame.num_rows for frame in frames), stream=stream
             ),
             rows_per_path,
+            source_index,
             exact,
         )
     return (
@@ -519,6 +517,7 @@ def read_lake_files(
             stream=stream,
         ),
         rows_per_path,
+        source_index,
         exact,
     )
 
@@ -576,7 +575,45 @@ def _group_filter(
     *,
     stream: Stream,
 ) -> tuple[plc.expressions.Expression | None, bool]:
-    """Parquet filter for one run of same-shaped files and whether it is exact."""
+    """
+    Translate a predicate into a parquet filter for one run of files.
+
+    Parameters
+    ----------
+    predicate
+        Predicate in terms of the table schema.
+    predicate_columns
+        Maps the name of each column ``predicate`` refers to onto its
+        ``Col`` node in ``predicate``.
+    path
+        First file of the run, whose metadata gives the column types of the
+        whole run. It is only read when ``predicate`` refers to a column in
+        ``read_keys``.
+    footer
+        Footer of ``path``, used to map keys to the names the files hold.
+    read_keys
+        Keys of the wanted columns that the files hold: field IDs for an
+        Iceberg scan read by field ID, otherwise column names.
+    wanted
+        Maps the key of each column the scan must produce to its name in the
+        table schema.
+    schema
+        Schema the scan must produce.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+
+    Returns
+    -------
+    filters
+        Parquet filter in terms of the names the files hold, or ``None`` when
+        no part of ``predicate`` can be applied while reading. The scalars
+        it holds are created on ``stream``, and its data is valid on
+        ``stream``.
+    exact
+        Whether ``filters`` is equivalent to ``predicate``. When it is not,
+        the rows read are a superset of the rows that satisfy ``predicate``,
+        which must be applied again after reading.
+    """
     name_by_key = dict(zip(footer.keys, footer.names, strict=True))
     file_names = {
         wanted[key]: name_by_key[key]
@@ -613,17 +650,67 @@ def _read_group(
     paths: Sequence[str],
     present: Sequence[Any],
     footer: _Footer,
-    num_rows: int,
+    rows_per_path: Sequence[int],
     wanted: Mapping[Any, str],
     schema: Schema,
     lake_options: LakeScanOptions,
     filters: plc.expressions.Expression | None,
+    source_offset: int | None,
     *,
     by_field_id: bool,
     stream: Stream,
-) -> DataFrame:
-    """Read one run of same-shaped files and map it onto the table schema."""
+) -> tuple[DataFrame, plc.Column | None]:
+    """
+    Read one run of same-shaped files and map it onto the table schema.
+
+    Parameters
+    ----------
+    paths
+        Data files of the run, in scan order. They hold the same top-level
+        columns, as the parquet reader requires of the sources of one read.
+    present
+        Keys of the wanted columns that the files hold: field IDs when
+        ``by_field_id``, otherwise column names. The files are only read
+        when this is non-empty.
+    footer
+        Footer of the first file of the run, used to map the column names
+        the reader returns back to their keys.
+    rows_per_path
+        Number of rows each file holds before ``filters`` is applied.
+    wanted
+        Maps the key of each column the scan must produce to its name in the
+        table schema, in output order.
+    schema
+        Schema the scan must produce.
+    lake_options
+        Options of the scan, giving the policy and defaults for columns the
+        files do not hold.
+    filters
+        Parquet filter to apply while reading, in terms of the names the
+        files hold, or ``None`` to read every row.
+    source_offset
+        Index within the scan of the first file of the run, or ``None`` when
+        the source of each row is not needed.
+    by_field_id
+        Whether ``present`` and ``wanted`` are keyed by Iceberg field ID
+        rather than by column name.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+
+    Returns
+    -------
+    frame
+        The rows read, with the columns of ``wanted`` renamed and cast to
+        the table schema. Columns the files do not hold are filled with
+        their initial default, or with nulls.
+    source_index
+        For each row of ``frame``, the index within the scan of the file it
+        was read from, or ``None`` when ``source_offset`` is ``None``. Its
+        data is valid on ``stream``.
+    """
     read: dict[Any, plc.Column] = {}
+    num_rows = sum(rows_per_path)
+    source_index: plc.Column | None = None
     if present:
         builder = plc.io.parquet.ParquetReaderOptions.builder(
             plc.io.SourceInfo(list(paths))
@@ -635,23 +722,60 @@ def _read_group(
             options.set_column_names(list(present))
         if filters is not None:
             options.set_filter(filters)
+        if source_offset is not None:
+            options.enable_prepend_source_index_column(val=True)
         table = plc.io.parquet.read_parquet(options, stream=stream)
         num_rows = table.tbl.num_rows()
+        names = table.column_names(include_children=False)
+        columns = table.tbl.columns()
+        if source_offset is not None:
+            source_index = (
+                columns[0]
+                if source_offset == 0
+                else plc.binaryop.binary_operation(
+                    columns[0],
+                    plc.Scalar.from_py(
+                        source_offset, plc.DataType(plc.TypeId.INT32), stream=stream
+                    ),
+                    plc.binaryop.BinaryOperator.ADD,
+                    plc.DataType(plc.TypeId.INT32),
+                    stream=stream,
+                )
+            )
+            names = names[1:]
+            columns = columns[1:]
         key_by_name = dict(zip(footer.names, footer.keys, strict=True))
         read = {
             key_by_name[name]: column
-            for name, column in zip(
-                table.column_names(include_children=False),
-                table.tbl.columns(),
-                strict=True,
-            )
+            for name, column in zip(names, columns, strict=True)
         }
+    elif source_offset is not None:
+        (source_index,) = plc.filling.repeat(
+            plc.Table(
+                [
+                    plc.filling.sequence(
+                        len(rows_per_path),
+                        plc.Scalar.from_py(
+                            source_offset, plc.DataType(plc.TypeId.INT32), stream=stream
+                        ),
+                        plc.Scalar.from_py(
+                            1, plc.DataType(plc.TypeId.INT32), stream=stream
+                        ),
+                        stream=stream,
+                    )
+                ]
+            ),
+            plc.Column.from_arrow(
+                pl.Series(values=rows_per_path, dtype=pl.Int32()), stream=stream
+            ),
+            stream=stream,
+        ).columns()
 
-    columns = []
+    frame_columns = []
     for key, name in wanted.items():
         dtype = schema[name]
         if key in read:
-            columns.append(
+            frame_columns.append(
                 Column(read[key], name=name, dtype=dtype).astype(dtype, stream)
             )
         elif lake_options.missing_columns_policy == "raise":
@@ -664,16 +788,16 @@ def _read_group(
                     num_rows,
                     stream=stream,
                 )
-                columns.append(Column(obj, name=name, dtype=dtype))
+                frame_columns.append(Column(obj, name=name, dtype=dtype))
             else:
                 (obj,) = plc.filling.repeat(
                     plc.Table([plc.Column.from_arrow(default, stream=stream)]),
                     num_rows,
                     stream=stream,
                 ).columns()
-                columns.append(
+                frame_columns.append(
                     Column(obj, name=name, dtype=dtype).astype(dtype, stream)
                 )
-    if not columns:
-        return DataFrame([], num_rows=num_rows, stream=stream)
-    return DataFrame(columns, stream=stream)
+    if not frame_columns:
+        return DataFrame([], num_rows=num_rows, stream=stream), source_index
+    return DataFrame(frame_columns, stream=stream), source_index
