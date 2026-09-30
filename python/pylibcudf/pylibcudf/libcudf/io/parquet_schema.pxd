@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from libc.stdint cimport int16_t, int32_t, int64_t, uint8_t
+from libc.stdint cimport int8_t, int16_t, int32_t, int64_t, uint8_t
 from libcpp cimport bool
 from libcpp.optional cimport optional
 from libcpp.string cimport string
@@ -10,6 +10,43 @@ from pylibcudf.exception_handler cimport libcudf_exception_handler
 
 
 cdef extern from "cudf/io/parquet_schema.hpp" namespace "cudf::io::parquet" nogil:
+    cpdef enum class Type(int8_t):
+        UNDEFINED
+        BOOLEAN
+        INT32
+        INT64
+        INT96
+        FLOAT
+        DOUBLE
+        BYTE_ARRAY
+        FIXED_LEN_BYTE_ARRAY
+
+    cpdef enum class ConvertedType(int8_t):
+        UNKNOWN
+        UTF8
+        MAP
+        MAP_KEY_VALUE
+        LIST
+        ENUM
+        DECIMAL
+        DATE
+        TIME_MILLIS
+        TIME_MICROS
+        TIMESTAMP_MILLIS
+        TIMESTAMP_MICROS
+        UINT_8
+        UINT_16
+        UINT_32
+        UINT_64
+        INT_8
+        INT_16
+        INT_32
+        INT_64
+        JSON
+        BSON
+        INTERVAL
+        NA
+
     cdef cppclass Statistics:
         optional[vector[uint8_t]] max
         optional[vector[uint8_t]] min
@@ -55,8 +92,13 @@ cdef extern from "cudf/io/parquet_schema.hpp" namespace "cudf::io::parquet" nogi
         optional[int16_t] ordinal
 
     cdef cppclass SchemaElement:
+        Type type
+        int32_t type_length
         string name
         int32_t num_children
+        optional[ConvertedType] converted_type
+        int32_t decimal_scale
+        int32_t decimal_precision
         optional[int32_t] field_id
 
     cdef cppclass FileMetaData:

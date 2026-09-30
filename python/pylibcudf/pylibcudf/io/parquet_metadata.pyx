@@ -23,6 +23,7 @@ from pylibcudf.libcudf.io cimport parquet_metadata as cpp_parquet_metadata
 from pylibcudf.libcudf.io.parquet_schema cimport (
     ColumnChunk as cpp_ColumnChunk,
     ColumnChunkMetaData as cpp_ColumnChunkMetaData,
+    ConvertedType as cpp_ConvertedType,
     FileMetaData as cpp_FileMetaData,
     RowGroup as cpp_RowGroup,
     SchemaElement as cpp_SchemaElement,
@@ -39,6 +40,11 @@ from rmm.pylibrmm.stream cimport Stream
 
 from typing import TYPE_CHECKING
 
+from pylibcudf.libcudf.io.parquet_schema import (
+    ConvertedType as ConvertedType,  # no-cython-lint
+    Type as PhysicalType,  # no-cython-lint
+)
+
 if TYPE_CHECKING:
     from typing_extensions import Buffer
     from pylibcudf.typing import CudaStreamLike
@@ -52,10 +58,12 @@ __all__ = [
     "ColumnChunk",
     "ColumnChunkMetaData",
     "ColumnChunkStatistics",
+    "ConvertedType",
     "FileMetaData",
     "ParquetColumnSchema",
     "ParquetMetadata",
     "ParquetSchema",
+    "PhysicalType",
     "RowGroup",
     "SchemaElement",
     "SortingColumn",
@@ -329,6 +337,34 @@ cdef class SchemaElement:
         if not self.c_obj.field_id.has_value():
             return None
         return self.c_obj.field_id.value()
+
+    @property
+    def type(self) -> PhysicalType:
+        """Physical type of the field; ``UNDEFINED`` for non-leaf elements."""
+        return PhysicalType(<int>self.c_obj.type)
+
+    @property
+    def type_length(self) -> int:
+        """Byte length of ``FIXED_LEN_BYTE_ARRAY`` values, or the bit length."""
+        return self.c_obj.type_length
+
+    @property
+    def converted_type(self) -> ConvertedType | None:
+        """Converted type of the field, if the writer recorded one."""
+        if not self.c_obj.converted_type.has_value():
+            return None
+        cdef cpp_ConvertedType converted_type = self.c_obj.converted_type.value()
+        return ConvertedType(<int>converted_type)
+
+    @property
+    def decimal_scale(self) -> int:
+        """Scale of a ``DECIMAL`` converted type."""
+        return self.c_obj.decimal_scale
+
+    @property
+    def decimal_precision(self) -> int:
+        """Precision of a ``DECIMAL`` converted type."""
+        return self.c_obj.decimal_precision
 
 
 cdef class SortingColumn:
