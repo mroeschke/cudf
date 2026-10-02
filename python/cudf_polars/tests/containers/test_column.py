@@ -244,6 +244,30 @@ def test_serialize_cache_miss():
     assert result.dtype == dtype
 
 
+@pytest.mark.parametrize(
+    "pl_dtype, values",
+    [
+        (pl.Enum(["a", "b", "c"]), ["b", None, "a", "c"]),
+        (pl.Enum([str(i) for i in range(300)]), ["1", None, "0", "299"]),
+        (pl.Categorical(), ["b", None, "a", "c"]),
+        (pl.Categorical(pl.Categories("serialize", "ns", pl.UInt8)), ["b", None, "a"]),
+    ],
+    ids=["enum", "enum_uint16", "categorical", "categorical_uint8"],
+)
+def test_categorical_serialize_roundtrip(pl_dtype, values):
+    stream = get_cuda_stream()
+    codes = pl.Series("a", values, dtype=pl_dtype).to_physical()
+    dtype = DataType(pl_dtype)
+    column = Column(plc.Column.from_arrow(codes, stream=stream), name="a", dtype=dtype)
+    header, frames = column.serialize(stream=stream)
+    cudf_polars.containers.datatype._from_polars.cache_clear()
+    result = Column.deserialize(header, frames, stream=stream)
+
+    assert result.dtype == dtype
+    assert result.obj.type() == dtype.plc_type
+    assert result.obj.to_arrow(stream=stream).to_pylist() == codes.to_list()
+
+
 # datetimes return instances of DataType, rather than DataTypeClass
 
 
@@ -283,11 +307,12 @@ def test_serialize_cache_miss():
             pl.Binary(),
             marks=pytest.mark.xfail(reason="Binary is not supported", strict=True),
         ),
-        # These Error
-        pytest.param(
-            pl.Enum(["a", "b"]),
-            marks=pytest.mark.xfail(reason="Enum is not supported", strict=True),
-        ),
+        pl.Enum(["a", "b"]),
+        pl.Enum([]),
+        pl.Categorical(),
+        pl.Categorical("fruit"),
+        pl.Categorical(pl.Categories("x", "ns", pl.UInt16)),
+        pl.Categorical(pl.Categories.random()),
         pl.Array(pl.Int8, shape=(1,)),
     ],
 )
