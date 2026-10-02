@@ -164,10 +164,10 @@ class DataFrame:
                     plc.Scalar.from_py(0, c.obj.type(), stream=self.stream),
                     stream=self.stream,
                 )
-                mask, null_count = plc.transform.bools_to_mask(
-                    plc.unary.is_valid(c.obj, stream=self.stream), stream=self.stream
+                table_columns[i] = filled.with_mask(
+                    plc.null_mask.copy_bitmask(c.obj, stream=self.stream),
+                    c.null_count,
                 )
-                table_columns[i] = filled.with_mask(mask, null_count)
         table = plc.Table(table_columns)
         table_with_metadata = _ObjectWithArrowMetadata(table, metadata, self.stream)
         df = pl.DataFrame(table_with_metadata).rename(name_map)
