@@ -21,32 +21,6 @@ cdef extern from "cudf/io/parquet_schema.hpp" namespace "cudf::io::parquet" nogi
         BYTE_ARRAY
         FIXED_LEN_BYTE_ARRAY
 
-    cpdef enum class ConvertedType(int8_t):
-        UNKNOWN
-        UTF8
-        MAP
-        MAP_KEY_VALUE
-        LIST
-        ENUM
-        DECIMAL
-        DATE
-        TIME_MILLIS
-        TIME_MICROS
-        TIMESTAMP_MILLIS
-        TIMESTAMP_MICROS
-        UINT_8
-        UINT_16
-        UINT_32
-        UINT_64
-        INT_8
-        INT_16
-        INT_32
-        INT_64
-        JSON
-        BSON
-        INTERVAL
-        NA
-
     cdef cppclass Statistics:
         optional[vector[uint8_t]] max
         optional[vector[uint8_t]] min
@@ -96,9 +70,6 @@ cdef extern from "cudf/io/parquet_schema.hpp" namespace "cudf::io::parquet" nogi
         int32_t type_length
         string name
         int32_t num_children
-        optional[ConvertedType] converted_type
-        int32_t decimal_scale
-        int32_t decimal_precision
         optional[int32_t] field_id
 
     cdef cppclass FileMetaData:

@@ -779,38 +779,25 @@ def test_file_metadata_schema_elements() -> None:
     )[0]
 
     PhysicalType = plc.io.parquet_metadata.PhysicalType
-    ConvertedType = plc.io.parquet_metadata.ConvertedType
     result = [
         (
             element.name,
             element.field_id,
             element.num_children,
             element.type,
-            element.converted_type,
             element.type_length,
-            element.decimal_scale,
-            element.decimal_precision,
         )
         for element in file_metadata.schema
     ]
     # Depth-first, root first.
     assert result == [
-        ("schema", None, 4, PhysicalType.UNDEFINED, None, 0, 0, 0),
-        ("a", 10, 0, PhysicalType.INT64, None, 0, 0, 0),
-        ("s", 20, 2, PhysicalType.UNDEFINED, None, 0, 0, 0),
-        ("x", 21, 0, PhysicalType.INT32, None, 0, 0, 0),
-        ("y", 22, 0, PhysicalType.BYTE_ARRAY, ConvertedType.UTF8, 0, 0, 0),
-        (
-            "dec",
-            30,
-            0,
-            PhysicalType.FIXED_LEN_BYTE_ARRAY,
-            ConvertedType.DECIMAL,
-            6,
-            2,
-            12,
-        ),
-        ("fixed", 40, 0, PhysicalType.FIXED_LEN_BYTE_ARRAY, None, 4, 0, 0),
+        ("schema", None, 4, PhysicalType.UNDEFINED, 0),
+        ("a", 10, 0, PhysicalType.INT64, 0),
+        ("s", 20, 2, PhysicalType.UNDEFINED, 0),
+        ("x", 21, 0, PhysicalType.INT32, 0),
+        ("y", 22, 0, PhysicalType.BYTE_ARRAY, 0),
+        ("dec", 30, 0, PhysicalType.FIXED_LEN_BYTE_ARRAY, 6),
+        ("fixed", 40, 0, PhysicalType.FIXED_LEN_BYTE_ARRAY, 4),
     ]
 
 
