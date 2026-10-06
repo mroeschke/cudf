@@ -57,3 +57,10 @@ def test_array_dtype_uses_physical_list():
 
     assert result.polars_type == dtype
     assert result.id() == plc.TypeId.LIST
+
+
+def test_time_dtype_uses_nanosecond_timestamp():
+    result = DataType(pl.Time())
+
+    assert result.polars_type == pl.Time()
+    assert result.id() == plc.TypeId.TIMESTAMP_NANOSECONDS

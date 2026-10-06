@@ -177,7 +177,7 @@ def _from_polars(dtype: pl.DataType) -> plc.DataType:
     elif isinstance(dtype, pl.Date):
         return plc.DataType(plc.TypeId.TIMESTAMP_DAYS)
     elif isinstance(dtype, pl.Time):
-        raise NotImplementedError("Time of day dtype not implemented")
+        return plc.DataType(plc.TypeId.TIMESTAMP_NANOSECONDS)
     elif isinstance(dtype, pl.Datetime):
         if dtype.time_unit == "ms":
             return plc.DataType(plc.TypeId.TIMESTAMP_MILLISECONDS)

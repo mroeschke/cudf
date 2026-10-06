@@ -60,6 +60,18 @@ def _create_polars_column_metadata(
     )
 
 
+def _reinterpret(column: plc.Column, dtype: plc.DataType) -> plc.Column:
+    return plc.Column(
+        dtype,
+        column.size(),
+        column.data(),
+        column.null_mask(),
+        column.null_count(),
+        column.offset(),
+        column.children(),
+    )
+
+
 # This is also defined in pylibcudf.interop
 class _ObjectWithArrowMetadata:
     def __init__(
@@ -134,18 +146,26 @@ class DataFrame:
             _create_polars_column_metadata(name, dtype.polars_type)
             for name, dtype in zip(name_map, self.dtypes, strict=True)
         ]
-        table_with_metadata = _ObjectWithArrowMetadata(
-            self.table, metadata, self.stream
-        )
+        table = self.table
+        if any(isinstance(dtype.polars_type, pl.Time) for dtype in self.dtypes):
+            table = plc.Table(
+                [
+                    _reinterpret(c.obj, plc.DataType(plc.TypeId.INT64))
+                    if isinstance(c.dtype.polars_type, pl.Time)
+                    else c.obj
+                    for c in self.columns
+                ]
+            )
+        table_with_metadata = _ObjectWithArrowMetadata(table, metadata, self.stream)
         df = pl.DataFrame(table_with_metadata).rename(name_map)
-        array_dtypes: dict[str, PolarsDataType] = {
+        cast_dtypes: dict[str, PolarsDataType] = {
             column.name: column.dtype.polars_type
             for column in self.columns
-            if isinstance(column.dtype.polars_type, pl.Array)
+            if isinstance(column.dtype.polars_type, (pl.Array, pl.Time))
         }
-        if array_dtypes:
+        if cast_dtypes:
             # TODO: Remove this cast when libcudf can export Arrow fixed-size lists.
-            df = df.cast(pl.Schema(array_dtypes), strict=True)
+            df = df.cast(pl.Schema(cast_dtypes), strict=True)
         return df.with_columns(
             pl.col(c.name).set_sorted(descending=c.order == plc.types.Order.DESCENDING)
             if c.is_sorted
