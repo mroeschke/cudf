@@ -305,7 +305,9 @@ class Translator:
                 for ir_node in (result, *result.children)
                 for dtype in ir_node.schema.values()
             ):
-                error = NotImplementedError(_TIME_PASSTHROUGH_ERROR)
+                error = NotImplementedError(
+                    f"{_TIME_PASSTHROUGH_ERROR}; unsupported node {type(node).__name__}"
+                )
                 self.errors.append(error)
                 return ir.ErrorNode(schema, str(error))
             if any(
