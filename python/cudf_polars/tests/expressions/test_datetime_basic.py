@@ -797,3 +797,78 @@ def test_datetime_time_passthrough(
 ):
     q = make_query(time_passthrough_frame)
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@pytest.fixture
+def time_gating_frame():
+    return pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [datetime.datetime(2024, 1, 1, 12), None], dtype=pl.Datetime("us")
+            ),
+            "b": [1, 2],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "make_query",
+    [
+        pytest.param(
+            lambda lf: pl.LazyFrame({"t": [datetime.time(1, 2, 3), None]}).select("t"),
+            id="scan",
+        ),
+        pytest.param(
+            lambda lf: pl.LazyFrame({"t": [datetime.time(1, 2, 3), None]}).select(
+                pl.col("t").dt.time()
+            ),
+            id="time_input",
+        ),
+        pytest.param(
+            lambda lf: lf.select(pl.lit(datetime.time(1, 2, 3))), id="literal"
+        ),
+        pytest.param(lambda lf: lf.select(pl.col("b").cast(pl.Time)), id="cast"),
+        pytest.param(
+            lambda lf: lf.select(pl.col("a").dt.time().dt.hour()), id="consume"
+        ),
+        pytest.param(
+            lambda lf: lf.with_columns(t=pl.col("a").dt.time()).filter(
+                pl.col("t") > datetime.time(6)
+            ),
+            id="compare",
+        ),
+        pytest.param(
+            lambda lf: lf.with_columns(t=pl.col("a").dt.time()).sort("t"),
+            id="sort_key",
+        ),
+        pytest.param(lambda lf: lf.sort(pl.col("a").dt.time()), id="sort_key_expr"),
+        pytest.param(
+            lambda lf: lf.group_by(pl.col("a").dt.time()).agg(pl.col("b").sum()),
+            id="group_by_key",
+        ),
+        pytest.param(
+            lambda lf: (
+                lf.with_columns(t=pl.col("a").dt.time())
+                .group_by("b")
+                .agg(pl.col("t").first())
+            ),
+            id="agg",
+        ),
+        pytest.param(
+            lambda lf: lf.with_columns(t=pl.col("a").dt.time()).unique(),
+            id="unique",
+        ),
+        pytest.param(
+            lambda lf: lf.select(pl.struct(pl.col("a").dt.time())), id="struct"
+        ),
+        pytest.param(
+            lambda lf: lf.with_columns(t=pl.col("a").dt.time()).join(
+                lf.with_columns(t=pl.col("a").dt.time()), on="t"
+            ),
+            id="join_key",
+        ),
+    ],
+)
+def test_datetime_time_unsupported(engine: pl.GPUEngine, time_gating_frame, make_query):
+    q = make_query(time_gating_frame)
+    assert_ir_translation_raises(q, engine, NotImplementedError)

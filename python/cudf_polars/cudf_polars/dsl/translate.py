@@ -57,6 +57,24 @@ _HAS_ROLLING_FUNCTION = hasattr(plrs._expr_nodes, "RollingFunction")
 
 _ARRAY_PASSTHROUGH_ERROR = "Only pass-through of Array columns is supported"
 
+_TIME_PASSTHROUGH_ERROR = (
+    "Only dt.time() and pass-through of Time columns are supported"
+)
+
+_TIME_PASSTHROUGH_IR_NODES = (
+    plrs._ir_nodes.Select,
+    plrs._ir_nodes.HStack,
+    plrs._ir_nodes.Filter,
+    plrs._ir_nodes.Slice,
+    plrs._ir_nodes.Sort,
+    plrs._ir_nodes.Cache,
+    plrs._ir_nodes.SimpleProjection,
+    plrs._ir_nodes.Union,
+    plrs._ir_nodes.HConcat,
+    plrs._ir_nodes.Join,
+    plrs._ir_nodes.GroupBy,
+)
+
 __all__ = ["Translator", "translate_named_expr"]
 
 
@@ -90,6 +108,29 @@ def _contains_array_input(expression: expr.Expr) -> bool:
     """Return whether an expression consumes an Array-typed input."""
     return any(
         _contains_array(node.dtype.polars_type) for node in traversal([expression])
+    )
+
+
+def _contains_time(dtype: pl.DataType) -> bool:
+    """Return whether ``dtype`` is or contains a Polars Time dtype."""
+    return any(isinstance(d, pl.Time) for d in pl.datatypes.unpack_dtypes(dtype))
+
+
+def _is_time_passthrough(expression: expr.Expr) -> bool:
+    """Return whether an expression is a supported producer of a Time column."""
+    if not isinstance(expression.dtype.polars_type, pl.Time):
+        return False
+    return isinstance(expression, expr.Col) or (
+        isinstance(expression, expr.TemporalFunction)
+        and expression.name is expr.TemporalFunction.Name.Time
+    )
+
+
+def _contains_time_input(expression: expr.Expr) -> bool:
+    """Return whether an expression consumes a Time-typed input."""
+    return any(
+        _contains_time(node.dtype.polars_type)
+        for node in traversal(list(expression.children))
     )
 
 
@@ -259,6 +300,14 @@ class Translator:
             except Exception as e:
                 self.errors.append(e)
                 return ir.ErrorNode(schema, str(e))
+            if not isinstance(node, _TIME_PASSTHROUGH_IR_NODES) and any(
+                _contains_time(dtype.polars_type)
+                for ir_node in (result, *result.children)
+                for dtype in ir_node.schema.values()
+            ):
+                error = NotImplementedError(_TIME_PASSTHROUGH_ERROR)
+                self.errors.append(error)
+                return ir.ErrorNode(schema, str(error))
             if any(
                 isinstance(dtype, pl.Null)
                 for dtype in pl.datatypes.unpack_dtypes(*polars_schema.values())
@@ -296,7 +345,7 @@ class Translator:
         return NotImplementedError(message, unique_errors)
 
     def translate_expr(
-        self, *, n: int, schema: Schema, allow_array_passthrough: bool = False
+        self, *, n: int, schema: Schema, allow_passthrough: bool = False
     ) -> expr.Expr:
         """
         Translate a polars-internal expression IR into our representation.
@@ -307,8 +356,8 @@ class Translator:
             Node to translate, an integer referencing a polars internal node.
         schema
             Schema of the IR node this expression uses as evaluation context.
-        allow_array_passthrough
-            Whether a direct Array column may be returned unchanged.
+        allow_passthrough
+            Whether a direct Array or Time column, or a ``dt.time()`` result, may be returned.
 
         Returns
         -------
@@ -337,7 +386,7 @@ class Translator:
             polars_dtype = pl.UInt64()
         dtype = DataType(polars_dtype)
         is_array_passthrough = (
-            allow_array_passthrough
+            allow_passthrough
             and isinstance(dtype.polars_type, pl.Array)
             and isinstance(node, plrs._expr_nodes.Column)
         )
@@ -352,6 +401,13 @@ class Translator:
             return expr.ErrorExpr(dtype, str(e))
         if not is_array_passthrough and _contains_array_input(translated):
             error = NotImplementedError(_ARRAY_PASSTHROUGH_ERROR)
+            self.errors.append(error)
+            return expr.ErrorExpr(dtype, str(error))
+        if (
+            _contains_time(dtype.polars_type)
+            and not (allow_passthrough and _is_time_passthrough(translated))
+        ) or _contains_time_input(translated):
+            error = NotImplementedError(_TIME_PASSTHROUGH_ERROR)
             self.errors.append(error)
             return expr.ErrorExpr(dtype, str(error))
         return translated
@@ -634,7 +690,7 @@ def _(node: plrs._ir_nodes.Select, translator: Translator, schema: Schema) -> ir
                     translator,
                     n=e,
                     schema=inp.schema,
-                    allow_array_passthrough=True,
+                    allow_passthrough=True,
                 )
                 for e in node.expr
             ]
@@ -760,7 +816,7 @@ def _(node: plrs._ir_nodes.HStack, translator: Translator, schema: Schema) -> ir
                     translator,
                     n=e,
                     schema=inp.schema,
-                    allow_array_passthrough=True,
+                    allow_passthrough=True,
                 )
                 for e in node.exprs
             ]
@@ -976,7 +1032,7 @@ def translate_named_expr(
     *,
     n: plrs._expr_nodes.PyExprIR,
     schema: Schema,
-    allow_array_passthrough: bool = False,
+    allow_passthrough: bool = False,
 ) -> expr.NamedExpr:
     """
     Translate a polars-internal named expression IR object into our representation.
@@ -989,8 +1045,8 @@ def translate_named_expr(
         Node to translate, a named expression node.
     schema
         Schema of the IR node this expression uses as evaluation context.
-    allow_array_passthrough
-        Whether a direct Array column may be returned unchanged.
+    allow_passthrough
+        Whether a direct Array or Time column, or a ``dt.time()`` result, may be returned.
 
     Returns
     -------
@@ -1013,7 +1069,7 @@ def translate_named_expr(
         translator.translate_expr(
             n=n.node,
             schema=schema,
-            allow_array_passthrough=allow_array_passthrough,
+            allow_passthrough=allow_passthrough,
         ),
     )
 
