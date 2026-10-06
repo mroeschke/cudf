@@ -40,6 +40,24 @@ _TIMESTAMP_TO_DURATION = {
 }
 
 
+def _find_tzif_dir(zone: str | None) -> str | None:
+    if zone is None or zone == "UTC":
+        return None
+    tzif_dir = next(
+        (
+            search_path
+            for search_path in zoneinfo.TZPATH
+            if (Path(search_path) / zone).is_file()
+        ),
+        None,
+    )
+    if tzif_dir is None:
+        raise NotImplementedError(
+            f"Time zone {zone!r} not found in system time zone data (zoneinfo.TZPATH)"
+        )
+    return tzif_dir
+
+
 def _tz_transition_columns(
     zone_name: str, tzif_dir: str, stream: Stream
 ) -> tuple[plc.Column, plc.Column] | None:
@@ -570,6 +588,7 @@ class TemporalFunction(Expr):
         Name.CastTimeUnit,
         Name.Truncate,
         Name.Date,
+        Name.Time,
         Name.DaysInMonth,
         Name.Quarter,
         Name.ConvertTimeZone,
@@ -623,27 +642,12 @@ class TemporalFunction(Expr):
                 "pl.Datetime", self.children[0].dtype.polars_type
             ).time_zone
             to_zone = self.options[0]
-            tzif_dirs: list[str | None] = []
-            for zone in (from_zone, to_zone):
-                if zone is None or zone == "UTC":
-                    # Normalize to not needing a tzif_dir lookup.
-                    tzif_dirs.append(None)
-                    continue
-                tzif_dir = next(
-                    (
-                        search_path
-                        for search_path in zoneinfo.TZPATH
-                        if (Path(search_path) / zone).is_file()
-                    ),
-                    None,
-                )
-                if tzif_dir is None:
-                    raise NotImplementedError(
-                        f"Time zone {zone!r} not found in system time zone data "
-                        "(zoneinfo.TZPATH)"
-                    )
-                tzif_dirs.append(tzif_dir)
-            self.tzif_dirs = (tzif_dirs[0], tzif_dirs[1])
+            self.tzif_dirs = (_find_tzif_dir(from_zone), _find_tzif_dir(to_zone))
+        elif self.name is TemporalFunction.Name.Time:
+            child_dtype = self.children[0].dtype.polars_type
+            if not isinstance(child_dtype, pl.Datetime):
+                raise NotImplementedError(f"dt.time on {child_dtype} input")
+            self.tzif_dirs = (_find_tzif_dir(child_dtype.time_zone), None)
         elif self.name in {
             TemporalFunction.Name.Truncate,
             TemporalFunction.Name.Round,
@@ -711,6 +715,41 @@ class TemporalFunction(Expr):
                     ambiguous.obj,
                     non_existent,
                     stream,
+                ),
+                dtype=self.dtype,
+            )
+        if self.name is TemporalFunction.Name.Time:
+            (column,) = columns
+            stream = df.stream
+            obj = column.obj
+            from_dir, _ = self.tzif_dirs
+            if from_dir is not None:
+                zone = cast("pl.Datetime", self.children[0].dtype.polars_type).time_zone
+                assert zone is not None
+                obj = _local_wall_clock(obj, (zone, from_dir), stream)
+            day_start = plc.datetime.floor_datetimes(
+                obj, plc.datetime.RoundingFrequency.DAY, stream=stream
+            )
+            time_of_day = plc.unary.cast(
+                plc.binaryop.binary_operation(
+                    obj,
+                    day_start,
+                    plc.binaryop.BinaryOperator.SUB,
+                    plc.DataType(_TIMESTAMP_TO_DURATION[obj.type().id()]),
+                    stream=stream,
+                ),
+                plc.DataType(plc.TypeId.DURATION_NANOSECONDS),
+                stream=stream,
+            )
+            return Column(
+                plc.Column(
+                    self.dtype.plc_type,
+                    time_of_day.size(),
+                    time_of_day.data(),
+                    time_of_day.null_mask(),
+                    time_of_day.null_count(),
+                    time_of_day.offset(),
+                    time_of_day.children(),
                 ),
                 dtype=self.dtype,
             )
