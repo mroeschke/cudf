@@ -22,7 +22,11 @@ from polars import polars as plrs  # type: ignore[attr-defined]
 import pylibcudf as plc
 
 from cudf_polars.containers import DataType
-from cudf_polars.containers.datatype import _contains_array, _contains_categorical
+from cudf_polars.containers.datatype import (
+    _contains_array,
+    _contains_categorical,
+    _contains_time,
+)
 from cudf_polars.dsl import expr, ir
 from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.to_ast import insert_colrefs
@@ -109,11 +113,6 @@ def _contains_array_input(expression: expr.Expr) -> bool:
     return any(
         _contains_array(node.dtype.polars_type) for node in traversal([expression])
     )
-
-
-def _contains_time(dtype: pl.DataType) -> bool:
-    """Return whether ``dtype`` is or contains a Polars Time dtype."""
-    return any(isinstance(d, pl.Time) for d in pl.datatypes.unpack_dtypes(dtype))
 
 
 def _is_time_passthrough(expression: expr.Expr) -> bool:

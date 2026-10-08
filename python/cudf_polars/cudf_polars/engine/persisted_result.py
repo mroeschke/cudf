@@ -42,7 +42,8 @@ from typing import TYPE_CHECKING
 import polars as pl
 from polars.io.plugins import register_io_source
 
-from cudf_polars.dsl.translate import Translator, _contains_time
+from cudf_polars.containers.datatype import _contains_time
+from cudf_polars.dsl.translate import Translator
 from cudf_polars.engine import rank_local_store
 from cudf_polars.engine.core import (
     drop_if_replicated,

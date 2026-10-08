@@ -40,30 +40,49 @@ SCALAR_NAME_TO_POLARS_TYPE_MAP: dict[str, pl.DataType] = {
 }
 
 
-def _contains_array(dtype: PolarsDataType) -> bool:
-    """Return whether ``dtype`` is or contains a Polars Array dtype."""
+def _contains_dtype(
+    dtype: PolarsDataType, types: tuple[type[pl.DataType], ...]
+) -> bool:
+    """Return whether ``dtype`` is or contains an instance of any of ``types``."""
     if isinstance(dtype, type):
         dtype = dtype()
-    if isinstance(dtype, pl.Array):
+    if isinstance(dtype, types):
         return True
-    if isinstance(dtype, pl.List):
-        return _contains_array(dtype.inner)
+    if isinstance(dtype, (pl.List, pl.Array)):
+        return _contains_dtype(dtype.inner, types)
     if isinstance(dtype, pl.Struct):
-        return any(_contains_array(field.dtype) for field in dtype.fields)
+        return any(_contains_dtype(field.dtype, types) for field in dtype.fields)
     return False
+
+
+def _contains_array(dtype: PolarsDataType) -> bool:
+    """Return whether ``dtype`` is or contains a Polars Array dtype."""
+    return _contains_dtype(dtype, (pl.Array,))
 
 
 def _contains_categorical(dtype: PolarsDataType) -> bool:
     """Return whether ``dtype`` is or contains a Polars Categorical or Enum dtype."""
-    if isinstance(dtype, type):
-        dtype = dtype()
-    if isinstance(dtype, (pl.Categorical, pl.Enum)):
-        return True
-    if isinstance(dtype, (pl.List, pl.Array)):
-        return _contains_categorical(dtype.inner)
-    if isinstance(dtype, pl.Struct):
-        return any(_contains_categorical(field.dtype) for field in dtype.fields)
-    return False
+    return _contains_dtype(dtype, (pl.Categorical, pl.Enum))
+
+
+def _contains_time(dtype: PolarsDataType) -> bool:
+    """Return whether ``dtype`` is or contains a Polars Time dtype."""
+    return _contains_dtype(dtype, (pl.Time,))
+
+
+_UNSUPPORTED_NESTED_DTYPES: tuple[tuple[str, tuple[type[pl.DataType], ...]], ...] = (
+    ("Categorical", (pl.Categorical, pl.Enum)),
+    ("Array", (pl.Array,)),
+    ("Time", (pl.Time,)),
+)
+
+
+def _check_nested_dtype(inner: PolarsDataType) -> None:
+    for name, types in _UNSUPPORTED_NESTED_DTYPES:
+        if _contains_dtype(inner, types):
+            raise NotImplementedError(
+                f"{name} nested inside another dtype is not supported"
+            )
 
 
 _CATEGORICAL_PHYSICAL_TO_TYPE_ID: dict[PolarsDataType, plc.TypeId] = {
@@ -262,22 +281,12 @@ def _from_polars(dtype: pl.DataType) -> plc.DataType:
     elif isinstance(dtype, pl.Categorical):
         return plc.DataType(_categorical_physical_type_id(dtype.categories.physical()))
     elif isinstance(dtype, pl.List):
-        if _contains_categorical(dtype.inner):
-            raise NotImplementedError(
-                "Categorical nested inside another dtype is not supported"
-            )
-        if _contains_array(dtype.inner):
-            raise NotImplementedError(
-                "Array nested inside another dtype is not supported"
-            )
+        _check_nested_dtype(dtype.inner)
         # Recurse to catch unsupported inner types
         _ = DataType(dtype.inner)
         return plc.DataType(plc.TypeId.LIST)
     elif isinstance(dtype, pl.Array):
-        if _contains_categorical(dtype.inner):
-            raise NotImplementedError(
-                "Categorical nested inside another dtype is not supported"
-            )
+        _check_nested_dtype(dtype.inner)
         inner = DataType(dtype.inner).plc_type
         if not plc.traits.is_fixed_width(inner):
             raise NotImplementedError(
@@ -287,14 +296,7 @@ def _from_polars(dtype: pl.DataType) -> plc.DataType:
     elif isinstance(dtype, pl.Struct):
         # Recurse to catch unsupported field types
         for field in dtype.fields:
-            if _contains_categorical(field.dtype):
-                raise NotImplementedError(
-                    "Categorical nested inside another dtype is not supported"
-                )
-            if _contains_array(field.dtype):
-                raise NotImplementedError(
-                    "Array nested inside another dtype is not supported"
-                )
+            _check_nested_dtype(field.dtype)
             _ = DataType(field.dtype)
         return plc.DataType(plc.TypeId.STRUCT)
     else:
