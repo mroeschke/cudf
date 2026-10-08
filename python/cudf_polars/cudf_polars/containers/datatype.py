@@ -55,21 +55,6 @@ def _contains_dtype(
     return False
 
 
-def _contains_array(dtype: PolarsDataType) -> bool:
-    """Return whether ``dtype`` is or contains a Polars Array dtype."""
-    return _contains_dtype(dtype, (pl.Array,))
-
-
-def _contains_categorical(dtype: PolarsDataType) -> bool:
-    """Return whether ``dtype`` is or contains a Polars Categorical or Enum dtype."""
-    return _contains_dtype(dtype, (pl.Categorical, pl.Enum))
-
-
-def _contains_time(dtype: PolarsDataType) -> bool:
-    """Return whether ``dtype`` is or contains a Polars Time dtype."""
-    return _contains_dtype(dtype, (pl.Time,))
-
-
 _UNSUPPORTED_NESTED_DTYPES: tuple[tuple[str, tuple[type[pl.DataType], ...]], ...] = (
     ("Categorical", (pl.Categorical, pl.Enum)),
     ("Array", (pl.Array,)),

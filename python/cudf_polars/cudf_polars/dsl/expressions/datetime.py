@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import functools
 import re
 import zoneinfo
 from enum import IntEnum, auto
@@ -40,6 +41,7 @@ _TIMESTAMP_TO_DURATION = {
 }
 
 
+@functools.cache
 def _find_tzif_dir(zone: str | None) -> str | None:
     if zone is None or zone == "UTC":
         return None

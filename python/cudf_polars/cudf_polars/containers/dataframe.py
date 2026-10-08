@@ -81,18 +81,6 @@ def _create_polars_column_metadata(
     )
 
 
-def _reinterpret(column: plc.Column, dtype: plc.DataType) -> plc.Column:
-    return plc.Column(
-        dtype,
-        column.size(),
-        column.data(),
-        column.null_mask(),
-        column.null_count(),
-        column.offset(),
-        column.children(),
-    )
-
-
 # This is also defined in pylibcudf.interop
 class _ObjectWithArrowMetadata:
     def __init__(
@@ -170,7 +158,15 @@ class DataFrame:
         table_columns = list(self.table.columns())
         for i, c in enumerate(self.columns):
             if isinstance(c.dtype.polars_type, pl.Time):
-                table_columns[i] = _reinterpret(c.obj, plc.DataType(plc.TypeId.INT64))
+                table_columns[i] = plc.Column(
+                    plc.DataType(plc.TypeId.INT64),
+                    c.obj.size(),
+                    c.obj.data(),
+                    c.obj.null_mask(),
+                    c.obj.null_count(),
+                    c.obj.offset(),
+                    c.obj.children(),
+                )
             elif c.dtype.is_categorical and c.null_count > 0:
                 # Polars requires non-null codes.
                 filled = plc.replace.replace_nulls(
