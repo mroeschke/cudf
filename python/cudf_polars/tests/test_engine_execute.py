@@ -203,27 +203,32 @@ def test_execute_unsupported_raises(streaming_engine):
         streaming_engine.execute(_unsupported_lf())
 
 
-def _datetime_lf() -> pl.LazyFrame:
-    return pl.LazyFrame(
-        {
-            "a": pl.Series(
-                [
-                    datetime.datetime(2024, 1, 1, 12, 30, 15),
-                    datetime.datetime(2024, 6, 2, 3, 4, 5),
-                ]
-            )
-        }
-    )
-
-
 def test_execute_time_output_raises(streaming_engine):
-    lf = _datetime_lf().with_columns(t=pl.col("a").dt.time())
+    lf = pl.LazyFrame(
+        {
+            "a": [
+                datetime.datetime(2024, 1, 1, 12, 30, 15),
+                datetime.datetime(2024, 6, 2, 3, 4, 5),
+            ]
+        }
+    ).with_columns(t=pl.col("a").dt.time())
     with pytest.raises(NotImplementedError, match="containing Time columns"):
         streaming_engine.execute(lf)
 
 
 def test_execute_time_dropped_before_output_roundtrips(streaming_engine):
-    lf = _datetime_lf().with_columns(t=pl.col("a").dt.time()).select("a")
+    lf = (
+        pl.LazyFrame(
+            {
+                "a": [
+                    datetime.datetime(2024, 1, 1, 12, 30, 15),
+                    datetime.datetime(2024, 6, 2, 3, 4, 5),
+                ]
+            }
+        )
+        .with_columns(t=pl.col("a").dt.time())
+        .select("a")
+    )
     result = streaming_engine.execute(lf)
     collected = result.lazy().collect(engine=streaming_engine)
     assert_frame_equal(collected, lf.collect())
