@@ -723,24 +723,6 @@ def test_datetime_time_from_integers(engine: pl.GPUEngine, time_unit):
     assert_gpu_result_equal(ldf.select(pl.col("a").dt.time()), engine=engine)
 
 
-@pytest.fixture
-def time_passthrough_frame():
-    return pl.LazyFrame(
-        {
-            "a": pl.Series(
-                [
-                    datetime.datetime(2024, 1, 1, 1, 2, 3),
-                    datetime.datetime(2024, 1, 2, 4, 5, 6),
-                    None,
-                    datetime.datetime(1960, 5, 5, 23, 0, 0),
-                ],
-                dtype=pl.Datetime("us"),
-            ),
-            "b": [1, 2, 3, 4],
-        }
-    )
-
-
 @pytest.mark.parametrize(
     "make_query",
     [
@@ -792,23 +774,23 @@ def time_passthrough_frame():
         ),
     ],
 )
-def test_datetime_time_passthrough(
-    engine: pl.GPUEngine, time_passthrough_frame, make_query
-):
-    q = make_query(time_passthrough_frame)
-    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
-
-
-@pytest.fixture
-def time_gating_frame():
-    return pl.LazyFrame(
+def test_datetime_time_passthrough(engine: pl.GPUEngine, make_query):
+    ldf = pl.LazyFrame(
         {
             "a": pl.Series(
-                [datetime.datetime(2024, 1, 1, 12), None], dtype=pl.Datetime("us")
+                [
+                    datetime.datetime(2024, 1, 1, 1, 2, 3),
+                    datetime.datetime(2024, 1, 2, 4, 5, 6),
+                    None,
+                    datetime.datetime(1960, 5, 5, 23, 0, 0),
+                ],
+                dtype=pl.Datetime("us"),
             ),
-            "b": [1, 2],
+            "b": [1, 2, 3, 4],
         }
     )
+    q = make_query(ldf)
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
 @pytest.mark.parametrize(
@@ -869,6 +851,14 @@ def time_gating_frame():
         ),
     ],
 )
-def test_datetime_time_unsupported(engine: pl.GPUEngine, time_gating_frame, make_query):
-    q = make_query(time_gating_frame)
+def test_datetime_time_unsupported(engine: pl.GPUEngine, make_query):
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [datetime.datetime(2024, 1, 1, 12), None], dtype=pl.Datetime("us")
+            ),
+            "b": [1, 2],
+        }
+    )
+    q = make_query(ldf)
     assert_ir_translation_raises(q, engine, NotImplementedError)

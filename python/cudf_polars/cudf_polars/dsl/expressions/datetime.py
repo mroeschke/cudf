@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import functools
 import re
 import zoneinfo
 from enum import IntEnum, auto
@@ -41,7 +40,6 @@ _TIMESTAMP_TO_DURATION = {
 }
 
 
-@functools.cache
 def _find_tzif_dir(zone: str | None) -> str | None:
     if zone is None or zone == "UTC":
         return None
@@ -723,12 +721,12 @@ class TemporalFunction(Expr):
         if self.name is TemporalFunction.Name.Time:
             (column,) = columns
             stream = df.stream
-            obj = column.obj
+            zone = cast("pl.Datetime", self.children[0].dtype.polars_type).time_zone
             from_dir, _ = self.tzif_dirs
-            if from_dir is not None:
-                zone = cast("pl.Datetime", self.children[0].dtype.polars_type).time_zone
-                assert zone is not None
-                obj = _local_wall_clock(obj, (zone, from_dir), stream)
+            from_zone_desc = (
+                (zone, from_dir) if zone is not None and from_dir is not None else None
+            )
+            obj = _local_wall_clock(column.obj, from_zone_desc, stream)
             day_start = plc.datetime.floor_datetimes(
                 obj, plc.datetime.RoundingFrequency.DAY, stream=stream
             )

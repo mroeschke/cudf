@@ -10,7 +10,6 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.dsl.expressions.datetime import _find_tzif_dir
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
     assert_ir_translation_raises,
@@ -271,7 +270,6 @@ def test_replace_time_zone_ambiguous_per_row_raises(engine):
 
 def test_replace_time_zone_unknown_zone_raises(engine, naive_frame, monkeypatch):
     monkeypatch.setattr(zoneinfo, "TZPATH", ())
-    _find_tzif_dir.cache_clear()
     q = naive_frame.select(pl.col("a").dt.replace_time_zone("Europe/Amsterdam"))
     assert_ir_translation_raises(q, engine, NotImplementedError)
 
