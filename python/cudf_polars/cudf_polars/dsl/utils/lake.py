@@ -660,19 +660,26 @@ def _element_layout(
 ) -> _ElementLayout:
     """Physical and logical type of a parquet schema element."""
     logical_type = element.logical_type
+    if logical_type is None:
+        return element.type, element.type_length, element.num_children, None
+    decimal_type = logical_type.decimal_type
+    temporal_type = (
+        logical_type.time_type
+        if logical_type.time_type is not None
+        else logical_type.timestamp_type
+    )
+    int_type = logical_type.int_type
     return (
         element.type,
         element.type_length,
         element.num_children,
-        None
-        if logical_type is None
-        else (
+        (
             logical_type.type,
-            logical_type.decimal_scale,
-            logical_type.decimal_precision,
-            logical_type.time_unit,
-            logical_type.bit_width,
-            logical_type.is_signed,
+            None
+            if decimal_type is None
+            else (decimal_type.scale, decimal_type.precision),
+            None if temporal_type is None else temporal_type.unit,
+            None if int_type is None else (int_type.bit_width, int_type.is_signed),
         ),
     )
 
