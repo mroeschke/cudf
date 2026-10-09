@@ -1112,7 +1112,7 @@ dependencies:
           # 'nvidia-ml-py' provides the 'pynvml' module
           - &nvidia_ml_py nvidia-ml-py>=12
           - packaging
-          - polars>=2.0.0rc2,<2.1
+          - polars>=2.0.0,<2.1
           - typing_extensions>=4.0.0
   run_cudf_polars_dask:
     common:

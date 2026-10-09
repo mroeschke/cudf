@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
@@ -23,10 +24,37 @@ if TYPE_CHECKING:
 
     from rmm.pylibrmm.stream import Stream
 
+    from cudf_polars.containers import DataType
     from cudf_polars.dsl.utils.io import CachedParquetInfo
     from cudf_polars.typing import Schema
 
+    _ElementLayout = tuple[
+        plc.io.parquet_metadata.PhysicalType, int, int, tuple[Any, ...] | None
+    ]
+    _Layout = tuple[_ElementLayout, ...]
+
 __all__ = ["IcebergColumn", "LakeScanOptions", "read_lake_files"]
+
+_INTEGER_TYPES = MappingProxyType(
+    {
+        plc.TypeId.INT8: (8, True),
+        plc.TypeId.INT16: (16, True),
+        plc.TypeId.INT32: (32, True),
+        plc.TypeId.INT64: (64, True),
+        plc.TypeId.UINT8: (8, False),
+        plc.TypeId.UINT16: (16, False),
+        plc.TypeId.UINT32: (32, False),
+        plc.TypeId.UINT64: (64, False),
+    }
+)
+_FLOAT_WIDTHS = MappingProxyType({plc.TypeId.FLOAT32: 32, plc.TypeId.FLOAT64: 64})
+_TIMESTAMP_DIGITS = MappingProxyType(
+    {
+        plc.TypeId.TIMESTAMP_MILLISECONDS: 3,
+        plc.TypeId.TIMESTAMP_MICROSECONDS: 6,
+        plc.TypeId.TIMESTAMP_NANOSECONDS: 9,
+    }
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -309,6 +337,24 @@ class LakeScanOptions:
             self, expected_columns=frozenset(names).union(hive_names)
         )
 
+    def check_field_ids(self, first_path: str) -> None:
+        """
+        Check that the first data file can be read by field ID.
+
+        Parameters
+        ----------
+        first_path
+            First data file of the scan.
+
+        Raises
+        ------
+        NotImplementedError
+            If the scan reads columns by field ID and ``first_path`` holds
+            no parquet field IDs. Other files are checked when they are read.
+        """
+        if self.columns is not None:
+            _footer(first_path, None, by_field_id=True)
+
     @property
     def has_deletions(self) -> bool:
         """Whether any rows have to be dropped after reading."""
@@ -500,7 +546,9 @@ def read_lake_files(
     source_indices: list[plc.Column] = []
     exact = True
     start = 0
-    for keys, group in itertools.groupby(footers, key=lambda footer: footer.keys):
+    for (keys, _), group in itertools.groupby(
+        footers, key=lambda footer: footer.group_key(wanted)
+    ):
         stop = start + len(list(group))
         present = frozenset(keys)
         read_keys = [key for key in wanted if key in present]
@@ -579,7 +627,54 @@ class _Footer:
 
     names: tuple[str, ...]
     keys: tuple[Any, ...]
+    signatures: tuple[_Layout, ...]
     num_rows: int
+
+    def group_key(
+        self, wanted: Mapping[Any, str]
+    ) -> tuple[tuple[Any, ...], tuple[_Layout, ...]]:
+        """
+        Key on which consecutive files can be read together.
+
+        Parameters
+        ----------
+        wanted
+            Maps the key of each column the scan must produce to its name in
+            the table schema.
+
+        Returns
+        -------
+        The top-level keys of the file, and the physical and logical types
+        of each wanted column it holds. The parquet reader requires the
+        selected columns of its sources to agree on both.
+        """
+        return self.keys, tuple(
+            signature
+            for key, signature in zip(self.keys, self.signatures, strict=True)
+            if key in wanted
+        )
+
+
+def _element_layout(
+    element: plc.io.parquet_metadata.SchemaElement,
+) -> _ElementLayout:
+    """Physical and logical type of a parquet schema element."""
+    logical_type = element.logical_type
+    return (
+        element.type,
+        element.type_length,
+        element.num_children,
+        None
+        if logical_type is None
+        else (
+            logical_type.type,
+            logical_type.decimal_scale,
+            logical_type.decimal_precision,
+            logical_type.time_unit,
+            logical_type.bit_width,
+            logical_type.is_signed,
+        ),
+    )
 
 
 def _footer(
@@ -597,6 +692,7 @@ def _footer(
     root = next(elements)
     names = []
     field_ids = []
+    signatures = []
     for _ in range(root.num_children):
         element = next(elements)
         if by_field_id and element.field_id is None:
@@ -605,12 +701,17 @@ def _footer(
             )
         names.append(element.name)
         field_ids.append(element.field_id)
+        signature = [_element_layout(element)]
         remaining = element.num_children
         while remaining:
-            remaining += next(elements).num_children - 1
+            child = next(elements)
+            signature.append(_element_layout(child))
+            remaining += child.num_children - 1
+        signatures.append(tuple(signature))
     return _Footer(
         names=tuple(names),
         keys=tuple(field_ids) if by_field_id else tuple(names),
+        signatures=tuple(signatures),
         num_rows=metadata.num_rows,
     )
 
@@ -697,6 +798,76 @@ def _group_filter(
     return filters, filters is not None and residual is None
 
 
+def _check_cast(
+    name: str,
+    incoming: plc.DataType,
+    target: DataType,
+    cast_columns_policy: Mapping[str, Any],
+) -> None:
+    """
+    Check that a column read from a file may be cast to the table type.
+
+    Parameters
+    ----------
+    name
+        Name of the column in the table schema.
+    incoming
+        Type the column was read with.
+    target
+        Type of the column in the table schema.
+    cast_columns_policy
+        Which casts from the physical to the table type are permitted.
+
+    Raises
+    ------
+    polars.exceptions.SchemaError
+        If ``cast_columns_policy`` forbids an integer, float or datetime
+        unit cast that the column needs. Other type differences are cast
+        without checking, since cudf and polars do not represent every
+        type the same way.
+    """
+    source = incoming.id()
+    dest = target.plc_type.id()
+    if source == dest:
+        return
+    if source in _INTEGER_TYPES and dest in _INTEGER_TYPES:
+        source_bits, source_signed = _INTEGER_TYPES[source]
+        dest_bits, dest_signed = _INTEGER_TYPES[dest]
+        allowed = (
+            cast_columns_policy["integer_upcast"]
+            and dest_bits > source_bits
+            and (dest_signed or not source_signed)
+        )
+    elif source in _FLOAT_WIDTHS and dest in _FLOAT_WIDTHS:
+        allowed = cast_columns_policy[
+            "float_upcast"
+            if _FLOAT_WIDTHS[dest] > _FLOAT_WIDTHS[source]
+            else "float_downcast"
+        ]
+    elif source in _INTEGER_TYPES and dest in _FLOAT_WIDTHS:
+        allowed = cast_columns_policy["integer_to_float_cast"]
+    elif source in _TIMESTAMP_DIGITS and dest in _TIMESTAMP_DIGITS:
+        source_digits = _TIMESTAMP_DIGITS[source]
+        dest_digits = _TIMESTAMP_DIGITS[dest]
+        if source_digits == 9:
+            allowed = cast_columns_policy["datetime_nanoseconds_downcast"]
+        elif source_digits == 6:
+            allowed = cast_columns_policy[
+                "datetime_microseconds_downcast"
+                if dest_digits == 3
+                else "datetime_microseconds_upcast"
+            ]
+        else:
+            allowed = cast_columns_policy["datetime_milliseconds_upcast"]
+    else:
+        return
+    if not allowed:
+        raise pl.exceptions.SchemaError(
+            f"data type mismatch for column {name}: "
+            f"incoming: {source.name} != target: {target.polars_type}"
+        )
+
+
 def _read_group(
     paths: Sequence[str],
     present: Sequence[Any],
@@ -718,7 +889,8 @@ def _read_group(
     ----------
     paths
         Data files of the run, in scan order. They hold the same top-level
-        columns, as the parquet reader requires of the sources of one read.
+        columns, with the same physical types for the wanted ones, as the
+        parquet reader requires of the sources of one read.
     present
         Keys of the wanted columns that the files hold: field IDs when
         ``by_field_id``, otherwise column names. The files are only read
@@ -826,6 +998,7 @@ def _read_group(
     for key, name in wanted.items():
         dtype = schema[name]
         if key in read:
+            _check_cast(name, read[key].type(), dtype, lake_options.cast_columns_policy)
             frame_columns.append(
                 Column(read[key], name=name, dtype=dtype).astype(dtype, stream)
             )

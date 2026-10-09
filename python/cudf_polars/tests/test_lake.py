@@ -27,7 +27,12 @@ import pyiceberg.schema  # noqa: E402
 from pyiceberg.catalog.sql import SqlCatalog  # noqa: E402
 from pyiceberg.partitioning import PartitionField, PartitionSpec  # noqa: E402
 from pyiceberg.transforms import IdentityTransform  # noqa: E402
-from pyiceberg.types import LongType, NestedField, StringType  # noqa: E402
+from pyiceberg.types import (  # noqa: E402
+    DoubleType,
+    LongType,
+    NestedField,
+    StringType,
+)
 
 
 @pytest.fixture
@@ -91,6 +96,35 @@ def renamed_iceberg(iceberg_catalog: SqlCatalog) -> str:
     pl.LazyFrame({"a": [4, 5], "b_renamed": ["p", "q"]}).sink_iceberg(
         tbl, mode="append"
     )
+    return tbl.metadata_location
+
+
+@pytest.fixture
+def promoted_iceberg(iceberg_catalog: SqlCatalog) -> str:
+    first = pl.LazyFrame(
+        {
+            "a": pl.Series([1, 2, 3], dtype=pl.Int32),
+            "b": ["x", "y", "z"],
+            "c": pl.Series([0.5, 1.5, 2.5], dtype=pl.Float32),
+        }
+    )
+    tbl = iceberg_catalog.create_table(
+        "ns.promoted", schema=first.collect_schema().to_arrow()
+    )
+    first.sink_iceberg(tbl, mode="append")
+
+    with tbl.update_schema() as update:
+        update.update_column("a", field_type=LongType())
+        update.update_column("c", field_type=DoubleType())
+    tbl.refresh()
+
+    pl.LazyFrame(
+        {
+            "a": pl.Series([4, 5], dtype=pl.Int64),
+            "b": ["p", "q"],
+            "c": pl.Series([3.5, 4.5], dtype=pl.Float64),
+        }
+    ).sink_iceberg(tbl, mode="append")
     return tbl.metadata_location
 
 
@@ -171,6 +205,7 @@ def evolved_hive(tmp_path: Path) -> Path:
         "flat_delta",
         "evolved_iceberg",
         "renamed_iceberg",
+        "promoted_iceberg",
         "partitioned_iceberg",
         "partitioned_delta",
         "deleted_rows_delta",
@@ -199,6 +234,11 @@ EVOLVED_PREDICATES = [
     (pl.col("b_renamed") != "x") & (pl.col("a") < 5),
     (pl.col("a") > 1) | (pl.col("c") > 2.0),
 ]
+PROMOTED_PREDICATES = [
+    pl.col("a") > 2,
+    pl.col("c") < 3.0,
+    (pl.col("a") > 1) & (pl.col("b") != "q"),
+]
 PARTITIONED_PREDICATES = [
     pl.col("a") > 1,
     pl.col("a").is_in([2, 3, 6]),
@@ -218,6 +258,7 @@ PARTITIONED_PREDICATES = [
         ),
         *(("evolved_iceberg", p) for p in EVOLVED_PREDICATES),
         ("renamed_iceberg", pl.col("b_renamed") != "y"),
+        *(("promoted_iceberg", p) for p in PROMOTED_PREDICATES),
         *(
             (table, p)
             for table in ("partitioned_iceberg", "partitioned_delta")
@@ -288,6 +329,8 @@ def test_scan_iceberg_schema_evolution(
         ),
         ("evolved_iceberg", lambda q: q.head(4).filter(pl.col("b_renamed") == "y")),
         ("renamed_iceberg", lambda q: q.filter(pl.col("b_renamed") == "y")),
+        ("promoted_iceberg", lambda q: q.filter(pl.col("a") < 3)),
+        ("promoted_iceberg", lambda q: q.filter(pl.col("b") == "q")),
         ("partitioned_iceberg", lambda q: q.filter(pl.col("a").is_in([2, 3]))),
         ("partitioned_delta", lambda q: q.filter(pl.col("a").is_in([2, 3]))),
     ],
@@ -300,6 +343,8 @@ def test_scan_iceberg_schema_evolution(
         "row_index_then_filter",
         "slice_then_filter",
         "renamed_only",
+        "promoted",
+        "promoted_other_column",
         "partitioned_iceberg",
         "partitioned_delta",
     ],
@@ -475,6 +520,125 @@ def test_scan_lake_missing_columns_raise(
     else:
         with pytest.raises(pl.exceptions.ColumnNotFoundError):
             q.collect(engine=engine)
+
+
+def _write_cast_files(
+    tmp_path: Path, source: pl.DataType, target: pl.DataType
+) -> list[str]:
+    paths = [str(tmp_path / "0.parquet"), str(tmp_path / "1.parquet")]
+    pl.DataFrame({"a": pl.Series([1, 2]).cast(source)}).write_parquet(paths[0])
+    pl.DataFrame({"a": pl.Series([3]).cast(target)}).write_parquet(paths[1])
+    return paths
+
+
+@pytest.mark.parametrize(
+    "source, target, cast_options",
+    [
+        (pl.Int32, pl.Int64, pl.ScanCastOptions(integer_cast="upcast")),
+        (pl.UInt16, pl.Int32, pl.ScanCastOptions(integer_cast="upcast")),
+        (pl.Int32, pl.Float64, pl.ScanCastOptions(integer_cast="allow-float")),
+        (pl.Float32, pl.Float64, pl.ScanCastOptions(float_cast="upcast")),
+        (pl.Float64, pl.Float32, pl.ScanCastOptions(float_cast="downcast")),
+        (
+            pl.Datetime("ns"),
+            pl.Datetime("us"),
+            pl.ScanCastOptions(datetime_cast="nanosecond-downcast"),
+        ),
+        (
+            pl.Datetime("ms"),
+            pl.Datetime("us"),
+            pl.ScanCastOptions(datetime_cast="millisecond-upcast"),
+        ),
+    ],
+    ids=[
+        "int_upcast",
+        "uint_to_wider_int",
+        "int_to_float",
+        "float_upcast",
+        "float_downcast",
+        "datetime_ns_downcast",
+        "datetime_ms_upcast",
+    ],
+)
+def test_scan_lake_cast_columns_allowed(
+    engine: pl.GPUEngine,
+    tmp_path: Path,
+    source: pl.DataType,
+    target: pl.DataType,
+    cast_options: pl.ScanCastOptions,
+) -> None:
+    q = pl.scan_parquet(
+        _write_cast_files(tmp_path, source, target),
+        schema={"a": target},
+        missing_columns="insert",
+        cast_options=cast_options,
+    )
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@pytest.mark.parametrize(
+    "source, target, cast_options",
+    [
+        (pl.Int32, pl.Int64, pl.ScanCastOptions()),
+        (pl.Int64, pl.Int32, pl.ScanCastOptions(integer_cast="upcast")),
+        (pl.Int32, pl.UInt64, pl.ScanCastOptions(integer_cast="upcast")),
+        (pl.Int32, pl.Float64, pl.ScanCastOptions(integer_cast="upcast")),
+        (pl.Float64, pl.Float32, pl.ScanCastOptions(float_cast="upcast")),
+        (pl.Datetime("ns"), pl.Datetime("us"), pl.ScanCastOptions()),
+        (
+            pl.Datetime("us"),
+            pl.Datetime("ms"),
+            pl.ScanCastOptions(datetime_cast="upcast"),
+        ),
+    ],
+    ids=[
+        "int_forbid",
+        "int_narrow",
+        "int_to_unsigned",
+        "int_to_float",
+        "float_downcast",
+        "datetime_forbid",
+        "datetime_downcast",
+    ],
+)
+def test_scan_lake_cast_columns_forbidden(
+    engine: pl.GPUEngine,
+    tmp_path: Path,
+    source: pl.DataType,
+    target: pl.DataType,
+    cast_options: pl.ScanCastOptions,
+) -> None:
+    q = pl.scan_parquet(
+        _write_cast_files(tmp_path, source, target),
+        schema={"a": target},
+        missing_columns="insert",
+        cast_options=cast_options,
+    )
+    with pytest.raises(pl.exceptions.SchemaError):
+        q.collect()
+    if is_streaming_engine(engine):
+        with pytest.RaisesGroup(pl.exceptions.SchemaError, flatten_subgroups=True):
+            q.collect(engine=engine)
+    else:
+        with pytest.raises(pl.exceptions.SchemaError):
+            q.collect(engine=engine)
+
+
+def test_scan_iceberg_without_field_ids(
+    in_memory_engine: pl.GPUEngine, tmp_path: Path
+) -> None:
+    path = str(tmp_path / "0.parquet")
+    pq.write_table(pa.table({"a": [1, 2]}), path)
+    schema = pa.schema(
+        [pa.field("a", pa.int64(), metadata={b"PARQUET:field_id": b"1"})]
+    )
+    q = pl.scan_parquet(
+        path,
+        schema={"a": pl.Int64},
+        missing_columns="insert",
+        _column_mapping=("iceberg-column-mapping", schema),
+    )
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
 def test_scan_lake_partition_values_without_column_mapping(

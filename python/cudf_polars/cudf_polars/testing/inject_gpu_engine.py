@@ -231,7 +231,7 @@ EXPECTED_FAILURES: dict[str, str] = {
     "tests/unit/io/test_delta.py::test_scan_delta_nanosecond_timestamp": "polars generates the wrong schema: https://github.com/pola-rs/polars/issues/23949",
     "tests/unit/io/test_delta.py::test_scan_delta_nanosecond_timestamp_nested": "polars generates the wrong schema: https://github.com/pola-rs/polars/issues/23949",
     "tests/unit/io/test_iceberg.py::test_scan_iceberg_row_index_renamed": "cudf-polars strips the file:// scheme from scan paths, so include_file_paths reports a different path than polars",
-    "tests/unit/io/test_iceberg.py::test_scan_iceberg_extra_columns": "The test asserts on polars' SchemaError for the raise column policies, which the GPU engine reports as a ComputeError",
+    "tests/unit/io/test_iceberg.py::test_scan_iceberg_extra_columns": "cudf-polars checks for extra columns by name rather than by Iceberg field ID, so a dropped column re-added under the same name raises ColumnNotFoundError instead of SchemaError",
     "tests/unit/io/test_iceberg.py::test_scan_iceberg_parquet_prefilter_with_column_mapping[True]": "The test asserts on the verbose log of the polars reader, which the GPU engine does not emit",
     "tests/unit/io/test_iceberg.py::test_scan_iceberg_parquet_prefilter_with_column_mapping[False]": "The test asserts on the verbose log of the polars reader, which the GPU engine does not emit",
     "tests/unit/io/test_io_plugin.py::test_defer_validate_false": "cudf-polars always validates the IO source schema, so validate_schema=False dtype mismatches are unsupported on GPU",

@@ -11,9 +11,7 @@ from packaging.version import parse
 from polars import __version__
 
 POLARS_VERSION = parse(__version__)
-# TODO: Tighten to "2.0.0" once polars 2.0.0 final is released. The release
-# candidate sorts before the final version, so a "2.0.0" bound would reject it.
-POLARS_LOWER_BOUND = parse("2.0.0rc2")
+POLARS_LOWER_BOUND = parse("2.0.0")
 POLARS_VERSION_LT_136 = POLARS_VERSION < parse("1.36.0")
 POLARS_VERSION_LT_137 = POLARS_VERSION < parse("1.37.0")
 POLARS_VERSION_LT_138 = POLARS_VERSION < parse("1.38.0")
