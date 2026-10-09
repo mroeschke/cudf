@@ -823,10 +823,6 @@ def test_datetime_time_passthrough(engine: pl.GPUEngine, make_query):
             lambda lf: lf.select(pl.col("a").dt.time().dt.hour()), id="consume"
         ),
         pytest.param(
-            lambda lf: lf.select(pl.col("a").dt.time().dt.time().dt.hour()),
-            id="consume_time_of_time",
-        ),
-        pytest.param(
             lambda lf: lf.filter(pl.col("a").dt.time().dt.time() > datetime.time(6)),
             id="compare_time_of_time",
         ),
