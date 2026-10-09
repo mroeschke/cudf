@@ -58,6 +58,12 @@ def _find_tzif_dir(zone: str | None) -> str | None:
     return tzif_dir
 
 
+def _get_tz_desc(zone: str | None) -> tuple[str, str] | None:
+    """Locate the TZif data needed to convert timestamps to or from ``zone``."""
+    tzif_dir = _find_tzif_dir(zone)
+    return None if zone is None or tzif_dir is None else (zone, tzif_dir)
+
+
 def _tz_transition_columns(
     zone_name: str, tzif_dir: str, stream: Stream
 ) -> tuple[plc.Column, plc.Column] | None:
@@ -534,7 +540,7 @@ class TemporalFunction(Expr):
                 raise ValueError("TemporalFunction required")
             return getattr(cls, name)
 
-    __slots__ = ("ambiguous_scalar", "name", "options", "tzif_dirs")
+    __slots__ = ("ambiguous_scalar", "name", "options", "tz_descs")
     _non_child = ("dtype", "name", "options")
     _COMPONENT_MAP: ClassVar[dict[Name, plc.datetime.DatetimeComponent]] = {
         Name.Year: plc.datetime.DatetimeComponent.YEAR,
@@ -610,7 +616,10 @@ class TemporalFunction(Expr):
         self.children = children
         self.is_pointwise = True
         self.ambiguous_scalar = None
-        self.tzif_dirs: tuple[str | None, str | None] = (None, None)
+        self.tz_descs: tuple[tuple[str, str] | None, tuple[str, str] | None] = (
+            None,
+            None,
+        )
         if self.name not in self._valid_ops:
             raise NotImplementedError(f"Temporal function {self.name}")
         if self.name is TemporalFunction.Name.ToString and plc.traits.is_duration(
@@ -641,13 +650,12 @@ class TemporalFunction(Expr):
             from_zone = cast(
                 "pl.Datetime", self.children[0].dtype.polars_type
             ).time_zone
-            to_zone = self.options[0]
-            self.tzif_dirs = (_find_tzif_dir(from_zone), _find_tzif_dir(to_zone))
+            self.tz_descs = (_get_tz_desc(from_zone), _get_tz_desc(self.options[0]))
         elif self.name is TemporalFunction.Name.Time:
             child_dtype = self.children[0].dtype.polars_type
             if not isinstance(child_dtype, pl.Datetime):
                 raise NotImplementedError(f"dt.time on {child_dtype} input")
-            self.tzif_dirs = (_find_tzif_dir(child_dtype.time_zone), None)
+            self.tz_descs = (_get_tz_desc(child_dtype.time_zone), None)
         elif self.name in {
             TemporalFunction.Name.Truncate,
             TemporalFunction.Name.Round,
@@ -676,20 +684,12 @@ class TemporalFunction(Expr):
             )
         if self.name is TemporalFunction.Name.ReplaceTimeZone:
             column, ambiguous = columns
-            from_zone = cast(
-                "pl.Datetime", self.children[0].dtype.polars_type
-            ).time_zone
-            to_zone = self.options[0]
             non_existent = self.options[1]
-            from_dir, to_dir = self.tzif_dirs
-            from_zone_desc = (
-                (from_zone, from_dir)
-                if from_zone is not None and from_dir is not None
-                else None
-            )
+            from_desc, to_desc = self.tz_descs
             stream = df.stream
-            same_zone = from_zone == to_zone or (from_dir is None and to_dir is None)
-            if same_zone and (from_dir is None or self.ambiguous_scalar == "raise"):
+            if from_desc == to_desc and (
+                from_desc is None or self.ambiguous_scalar == "raise"
+            ):
                 return Column(
                     column.obj,
                     dtype=self.dtype,
@@ -698,8 +698,8 @@ class TemporalFunction(Expr):
                     null_order=column.null_order,
                     name=column.name,
                 )
-            local = _local_wall_clock(column.obj, from_zone_desc, stream)
-            if to_dir is None:
+            local = _local_wall_clock(column.obj, from_desc, stream)
+            if to_desc is None:
                 return Column(
                     _apply_ambiguous_without_transitions(
                         local, self.ambiguous_scalar, ambiguous.obj, stream
@@ -709,8 +709,7 @@ class TemporalFunction(Expr):
             return Column(
                 _localize(
                     local,
-                    to_zone,
-                    to_dir,
+                    *to_desc,
                     self.ambiguous_scalar,
                     ambiguous.obj,
                     non_existent,
@@ -721,12 +720,7 @@ class TemporalFunction(Expr):
         if self.name is TemporalFunction.Name.Time:
             (column,) = columns
             stream = df.stream
-            zone = cast("pl.Datetime", self.children[0].dtype.polars_type).time_zone
-            from_dir, _ = self.tzif_dirs
-            from_zone_desc = (
-                (zone, from_dir) if zone is not None and from_dir is not None else None
-            )
-            obj = _local_wall_clock(column.obj, from_zone_desc, stream)
+            obj = _local_wall_clock(column.obj, self.tz_descs[0], stream)
             day_start = plc.datetime.floor_datetimes(
                 obj, plc.datetime.RoundingFrequency.DAY, stream=stream
             )
