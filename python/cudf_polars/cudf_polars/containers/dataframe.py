@@ -187,7 +187,9 @@ class DataFrame:
             if isinstance(column.dtype.polars_type, (pl.Array, pl.Time))
         }
         if cast_dtypes:
-            # TODO: Remove this cast when libcudf can export Arrow fixed-size lists.
+            # TODO: Remove this cast when:
+            # 1. libcudf can export Arrow fixed-size lists.
+            # 2. libcudf natively supports TIME64 type
             df = df.cast(pl.Schema(cast_dtypes), strict=True)
         categorical_columns = [c for c in self.columns if c.dtype.is_categorical]
         if categorical_columns:
