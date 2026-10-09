@@ -772,6 +772,15 @@ def test_datetime_time_from_integers(engine: pl.GPUEngine, time_unit):
             ),
             id="hconcat",
         ),
+        pytest.param(
+            lambda lf: lf.select(pl.col("a").dt.time().dt.time()), id="time_of_time"
+        ),
+        pytest.param(
+            lambda lf: lf.with_columns(t=pl.col("a").dt.time()).select(
+                pl.col("t").dt.time()
+            ),
+            id="time_of_time_column",
+        ),
     ],
 )
 def test_datetime_time_passthrough(engine: pl.GPUEngine, make_query):
@@ -812,6 +821,14 @@ def test_datetime_time_passthrough(engine: pl.GPUEngine, make_query):
         pytest.param(lambda lf: lf.select(pl.col("b").cast(pl.Time)), id="cast"),
         pytest.param(
             lambda lf: lf.select(pl.col("a").dt.time().dt.hour()), id="consume"
+        ),
+        pytest.param(
+            lambda lf: lf.select(pl.col("a").dt.time().dt.time().dt.hour()),
+            id="consume_time_of_time",
+        ),
+        pytest.param(
+            lambda lf: lf.filter(pl.col("a").dt.time().dt.time() > datetime.time(6)),
+            id="compare_time_of_time",
         ),
         pytest.param(
             lambda lf: lf.with_columns(t=pl.col("a").dt.time()).filter(

@@ -434,22 +434,24 @@ class Translator:
             )
             self.errors.append(error)
             return expr.ErrorExpr(dtype, str(error))
+        is_time_function = (
+            isinstance(translated, expr.TemporalFunction)
+            and translated.name is expr.TemporalFunction.Name.Time
+        )
         is_time_passthrough = (
             allow_passthrough
             and isinstance(dtype.polars_type, pl.Time)
-            and (
-                isinstance(translated, expr.Col)
-                or (
-                    isinstance(translated, expr.TemporalFunction)
-                    and translated.name is expr.TemporalFunction.Name.Time
-                )
-            )
+            and (isinstance(translated, expr.Col) or is_time_function)
         )
         if (
             _contains_dtype(dtype.polars_type, (pl.Time,)) and not is_time_passthrough
-        ) or any(
-            _contains_dtype(child.dtype.polars_type, (pl.Time,))
-            for child in traversal(list(translated.children))
+        ) or (
+            # dt.time() children were already validated with allow_passthrough=True.
+            not is_time_function
+            and any(
+                _contains_dtype(child.dtype.polars_type, (pl.Time,))
+                for child in traversal(list(translated.children))
+            )
         ):
             error = NotImplementedError(
                 "Only dt.time() and pass-through of Time columns are supported"
@@ -1245,7 +1247,14 @@ def _(
             dtype,
             expr.TemporalFunction.Name.from_polars(name),
             options,
-            *(translator.translate_expr(n=n, schema=schema) for n in node.input),
+            *(
+                translator.translate_expr(
+                    n=n,
+                    schema=schema,
+                    allow_passthrough=name == plrs._expr_nodes.TemporalFunction.Time,
+                )
+                for n in node.input
+            ),
         )
         if name in needs_cast:
             return expr.Cast(dtype, True, result_expr)  # noqa: FBT003

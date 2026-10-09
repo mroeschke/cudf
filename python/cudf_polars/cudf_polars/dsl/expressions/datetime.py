@@ -653,9 +653,10 @@ class TemporalFunction(Expr):
             self.tz_descs = (_get_tz_desc(from_zone), _get_tz_desc(self.options[0]))
         elif self.name is TemporalFunction.Name.Time:
             child_dtype = self.children[0].dtype.polars_type
-            if not isinstance(child_dtype, pl.Datetime):
+            if isinstance(child_dtype, pl.Datetime):
+                self.tz_descs = (_get_tz_desc(child_dtype.time_zone), None)
+            elif not isinstance(child_dtype, pl.Time):
                 raise NotImplementedError(f"dt.time on {child_dtype} input")
-            self.tz_descs = (_get_tz_desc(child_dtype.time_zone), None)
         elif self.name in {
             TemporalFunction.Name.Truncate,
             TemporalFunction.Name.Round,
@@ -719,6 +720,8 @@ class TemporalFunction(Expr):
             )
         if self.name is TemporalFunction.Name.Time:
             (column,) = columns
+            if isinstance(column.dtype.polars_type, pl.Time):
+                return column
             stream = df.stream
             obj = _local_wall_clock(column.obj, self.tz_descs[0], stream)
             day_start = plc.datetime.floor_datetimes(
