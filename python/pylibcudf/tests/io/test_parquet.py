@@ -1925,6 +1925,21 @@ def test_read_parquet_builder_dictionary32_columns_and_output_dict_columns_exclu
             builder.dictionary32_columns(["a"]).output_dict_columns(True)
 
 
+def test_read_parquet_dictionary32_columns_missing_raises(
+    dictionary32_source,
+) -> None:
+    options = (
+        plc.io.parquet.ParquetReaderOptions.builder(
+            plc.io.SourceInfo([dictionary32_source])
+        )
+        .dictionary32_columns(["b", "missing"])
+        .ignore_missing_columns(False)
+        .build()
+    )
+    with pytest.raises(ValueError, match="missing"):
+        plc.io.parquet.read_parquet(options)
+
+
 def test_read_parquet_dictionary32_columns_non_string_raises(
     dictionary32_source,
 ) -> None:

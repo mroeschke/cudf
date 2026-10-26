@@ -932,6 +932,25 @@ void reader_impl::initialize_output_dict_column_mask(parquet_reader_options cons
   auto dictionary32_column_names =
     make_column_path_set(_options.case_sensitive_names, dictionary32_columns.size());
   dictionary32_column_names.insert(dictionary32_columns.begin(), dictionary32_columns.end());
+
+  if (not dictionary32_columns.empty() and not ignore_missing_columns_policy(options)) {
+    // Match against the source schemas, not `_output_buffers`, since the hybrid scan reader
+    // materializes the filter and payload columns in separate passes.
+    auto top_level_names = make_column_path_set(_options.case_sensitive_names);
+    for (std::size_t src_idx = 0; src_idx < _metadata->get_num_sources(); ++src_idx) {
+      auto const pfm_idx = static_cast<int>(src_idx);
+      for (auto const child_idx : _metadata->get_schema(0, pfm_idx).children_idx) {
+        top_level_names.insert(_metadata->get_schema(child_idx, pfm_idx).name);
+      }
+    }
+    for (auto const& name : dictionary32_columns) {
+      CUDF_EXPECTS(
+        top_level_names.contains(name),
+        std::format("Encountered non-existent column '{}' in the DICTIONARY32 columns", name),
+        std::invalid_argument);
+    }
+  }
+
   auto const mask = _output_buffers | std::views::transform([&](auto const& buff) {
                       return output_all_columns or dictionary32_column_names.contains(buff.name);
                     });

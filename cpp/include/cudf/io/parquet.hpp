@@ -692,9 +692,10 @@ class parquet_reader_options {
   /**
    * @brief Sets names of top-level string columns to output as DICTIONARY32 encoded columns.
    *
-   * Only flat STRING columns are affected. Names that do not match an output column, or that match
-   * a non-string or nested column, are ignored. Names are matched according to
-   * `is_enabled_case_sensitive_names()`.
+   * Only flat STRING columns are affected. Names that match a non-string or nested column, or that
+   * match a column not selected for output, are ignored. Names that do not exist in the input files
+   * are ignored silently. This behavior can be changed by setting `enable_ignore_missing_columns`
+   * to false. Names are matched according to `is_enabled_case_sensitive_names()`.
    *
    * When AST/JIT filters are set, the selected string columns are materialized, then operated on
    * by the filter. The filtered results are then encoded as DICTIONARY32 columns.

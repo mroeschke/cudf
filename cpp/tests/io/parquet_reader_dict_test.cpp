@@ -31,7 +31,9 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -671,6 +673,38 @@ TEST_F(ParquetReaderDictTest, Dictionary32ColumnsIgnoresUnmatchedNames)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(key_col, read_table->view().column(0));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(list_col->view(), read_table->view().column(1));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(str_col, read_table->view().column(2));
+}
+
+TEST_F(ParquetReaderDictTest, Dictionary32ColumnsMissingNamesThrowWithoutIgnoreMissingColumns)
+{
+  auto key_col  = make_int_key_column();
+  auto list_col = make_low_cardinality_lists_of_strings();
+  auto str_col  = make_low_cardinality_strings();
+
+  auto const input_tbl = cudf::table_view{{key_col, list_col->view(), str_col}};
+  auto const filepath = temp_env->get_temp_filepath("Dictionary32ColumnsMissingNamesThrow.parquet");
+  write_parquet(input_tbl, {"key", "list", "str"}, filepath);
+
+  for (auto const& missing_name : {"missing", "list.element"}) {
+    auto const read_opts =
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+        .dictionary32_columns({missing_name})
+        .ignore_missing_columns(false)
+        .build();
+    EXPECT_THROW(std::ignore = cudf::io::read_parquet(read_opts), std::invalid_argument);
+  }
+
+  auto const read_opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                           .column_names({"str"})
+                           .dictionary32_columns({"key", "list", "str"})
+                           .ignore_missing_columns(false)
+                           .build();
+  auto const read_table = cudf::io::read_parquet(read_opts).tbl;
+  ASSERT_EQ(read_table->num_columns(), 1);
+  auto const read_col = read_table->view().column(0);
+  ASSERT_EQ(read_col.type().id(), cudf::type_id::DICTIONARY32);
+  auto const decoded = cudf::dictionary::decode(cudf::dictionary_column_view(read_col));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(str_col, decoded->view());
 }
 
 TEST_F(ParquetReaderDictTest, Dictionary32ColumnsCaseSensitivity)

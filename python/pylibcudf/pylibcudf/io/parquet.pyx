@@ -420,8 +420,10 @@ cdef class ParquetReaderOptions:
         """
         Sets names of top-level string columns to read as DICTIONARY32 columns.
 
-        Names that do not match an output column, or that match a non-string
-        or nested column, are ignored.
+        Names that match a non-string or nested column, or that match a
+        column not selected for output, are ignored. Names that do not exist
+        in the input files are ignored unless ``ignore_missing_columns`` is
+        set to ``False``, in which case reading raises a ``ValueError``.
 
         Parameters
         ----------
@@ -718,8 +720,10 @@ cdef class ParquetReaderOptionsBuilder:
         """
         Sets names of top-level string columns to read as DICTIONARY32 columns.
 
-        Names that do not match an output column, or that match a non-string
-        or nested column, are ignored.
+        Names that match a non-string or nested column, or that match a
+        column not selected for output, are ignored. Names that do not exist
+        in the input files are ignored unless ``ignore_missing_columns`` is
+        set to ``False``, in which case reading raises a ``ValueError``.
 
         Parameters
         ----------

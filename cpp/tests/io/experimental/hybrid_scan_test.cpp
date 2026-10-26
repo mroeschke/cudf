@@ -1827,3 +1827,38 @@ TEST_F(HybridScanTest, Dictionary32ColumnsMaterializeFilterColumns)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected->view().column(2),
                                       payload_result.tbl->view().column(1));
 }
+
+TEST_F(HybridScanTest, Dictionary32ColumnsMissingNamesThrowWithoutIgnoreMissingColumns)
+{
+  auto const input    = make_dictionary32_table([](auto) { return true; });
+  auto const filepath = temp_env->get_temp_filepath("HybridScanDictionary32MissingNames.parquet");
+  write_dictionary32_parquet(input->view(), filepath);
+  auto datasource = cudf::io::datasource::create(filepath);
+
+  auto literal_value = cudf::numeric_scalar<int32_t>(1000);
+  auto const literal = cudf::ast::literal(literal_value);
+  auto const col_ref = cudf::ast::column_name_reference("key");
+  auto const filter_expr =
+    cudf::ast::operation(cudf::ast::ast_operator::GREATER_EQUAL, col_ref, literal);
+
+  auto const missing_options = cudf::io::parquet_reader_options::builder()
+                                 .filter(filter_expr)
+                                 .dictionary32_columns({"b", "missing"})
+                                 .ignore_missing_columns(false)
+                                 .build();
+  EXPECT_THROW(
+    std::ignore = materialize_dictionary32_filter_and_payload(*datasource, missing_options),
+    std::invalid_argument);
+
+  auto const options = cudf::io::parquet_reader_options::builder()
+                         .filter(filter_expr)
+                         .dictionary32_columns({"b"})
+                         .ignore_missing_columns(false)
+                         .build();
+  auto const [filter_result, payload_result] =
+    materialize_dictionary32_filter_and_payload(*datasource, options);
+  auto const expected = make_dictionary32_table([](auto i) { return i >= 1000; });
+
+  ASSERT_EQ(payload_result.tbl->num_columns(), 2);
+  expect_dictionary32_column(payload_result.tbl->view().column(1), expected->view().column(2));
+}
