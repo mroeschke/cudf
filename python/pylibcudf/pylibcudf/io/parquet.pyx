@@ -444,12 +444,15 @@ cdef class ParquetReaderOptions:
 
     cpdef list get_dictionary32_columns(self):
         """
-        Returns names of top-level string columns read as DICTIONARY32 columns.
+        Returns configured names of columns to read as DICTIONARY32 columns.
+
+        The names are returned as set, including names that do not match an
+        output column or that match a non-string or nested column.
 
         Returns
         -------
         list[str]
-            Names of top-level string columns read as DICTIONARY32 columns
+            Configured names of columns to read as DICTIONARY32 columns
         """
         cdef vector[string] names = self.c_obj.get_dictionary32_columns()
         return [name.decode() for name in names]
