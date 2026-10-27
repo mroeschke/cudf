@@ -1240,6 +1240,7 @@ def run_polars_query(
                     run_config.dataset_path,
                     query_set=duckdb_queries_cls.name,
                     suffix=run_config.suffix,
+                    input_format=run_config.input_format,
                     run_config=run_config,
                 ).with_columns(*casts)
             case "duckdb-disk":
@@ -1872,6 +1873,7 @@ def _duckdb_register_views(
     dataset_path: str | Path,
     suffix: str,
     query_set: str,
+    input_format: InputFormat = "parquet",
 ) -> None:
     """Register one view per table in the query set over `dataset_path`."""
     if is_remote_path(dataset_path):
@@ -1880,13 +1882,18 @@ def _duckdb_register_views(
         conn.execute("INSTALL httpfs")
         conn.execute("LOAD httpfs")
         conn.execute("CREATE OR REPLACE SECRET (TYPE s3, PROVIDER credential_chain)")
+    if input_format == "iceberg":
+        conn.execute("INSTALL iceberg")
+        conn.execute("LOAD iceberg")
 
+    root = str(dataset_path).removesuffix("/")
     tbl_names = PDSDS_TABLE_NAMES if query_set == "pdsds" else PDSH_TABLE_NAMES
     for name in tbl_names:
-        pattern = str(dataset_path).removesuffix("/") + f"/{name}{suffix}"
-        conn.execute(
-            f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM parquet_scan('{pattern}');"
-        )
+        if input_format == "iceberg":
+            source = f"iceberg_scan('{root}/iceberg/{name}')"
+        else:
+            source = f"parquet_scan('{root}/{name}{suffix}')"
+        conn.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM {source};")
 
 
 def print_duckdb_plan(
@@ -1897,13 +1904,15 @@ def print_duckdb_plan(
     query_set: str,
     args: argparse.Namespace,
     run_config: RunConfig | None = None,
+    *,
+    input_format: InputFormat = "parquet",
 ) -> None:
     """Print DuckDB query plan using EXPLAIN."""
     if duckdb is None:
         raise ImportError(duckdb_err)
 
     with duckdb.connect(config=_make_duckdb_config(run_config)) as conn:
-        _duckdb_register_views(conn, dataset_path, suffix, query_set)
+        _duckdb_register_views(conn, dataset_path, suffix, query_set, input_format)
 
         if args.explain_logical and args.explain:
             conn.execute("PRAGMA explain_output = 'all';")
@@ -1925,16 +1934,17 @@ def execute_duckdb_query(
     *,
     suffix: str = ".parquet",
     query_set: str = "pdsh",
+    input_format: InputFormat = "parquet",
     run_config: RunConfig | None = None,
 ) -> pl.DataFrame:
     """Execute a query with DuckDB."""
     if duckdb is None:
         raise ImportError(duckdb_err)
     with duckdb.connect(config=_make_duckdb_config(run_config)) as conn:
-        _duckdb_register_views(conn, dataset_path, suffix, query_set)
+        _duckdb_register_views(conn, dataset_path, suffix, query_set, input_format)
         result = conn.sql(query).pl()
-        assert isinstance(result, pl.DataFrame)
-        return result
+    assert isinstance(result, pl.DataFrame)
+    return result
 
 
 def run_duckdb(duckdb_queries_cls: Any, args: argparse.Namespace) -> None:
@@ -1966,6 +1976,7 @@ def run_duckdb(duckdb_queries_cls: Any, args: argparse.Namespace) -> None:
                 query_set=duckdb_queries_cls.name,
                 args=args,
                 run_config=run_config,
+                input_format=run_config.input_format,
             )
 
         print(f"DuckDB Executing: {q_id}")
@@ -1980,6 +1991,7 @@ def run_duckdb(duckdb_queries_cls: Any, args: argparse.Namespace) -> None:
                 run_config.dataset_path,
                 suffix=run_config.suffix,
                 query_set=duckdb_queries_cls.name,
+                input_format=run_config.input_format,
                 run_config=run_config,
             )
             t1 = time.time()
