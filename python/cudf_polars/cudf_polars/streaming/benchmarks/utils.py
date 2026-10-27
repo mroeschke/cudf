@@ -153,6 +153,7 @@ def get_validation_options(run_options: RunOptions) -> dict[str, Any]:
 
 _STREAMING_FRONTENDS = frozenset({"dask", "ray", "spmd"})
 _CPU_ENGINES = frozenset({"polars-cpu", "duckdb"})
+InputFormat = Literal["parquet", "iceberg"]
 
 EXIT_SUCCESS = 0
 EXIT_QUERY_FAILURE = 3
@@ -496,7 +497,13 @@ class HardwareInfo:
         return cls(gpus=gpus, cpu=CPUInfo.collect())
 
 
-def get_data(path: str | Path, table_name: str, suffix: str = "") -> pl.LazyFrame:
+def get_data(
+    path: str | Path,
+    table_name: str,
+    suffix: str = "",
+    *,
+    input_format: InputFormat = "parquet",
+) -> pl.LazyFrame:
     """
     Get table from dataset.
 
@@ -505,21 +512,28 @@ def get_data(path: str | Path, table_name: str, suffix: str = "") -> pl.LazyFram
     When the file ``{path}/{table_name}{suffix}`` does not exist on the
     local filesystem, falls back to scanning ``{path}/{table_name}`` as a
     directory of parquet files.
+
+    With ``input_format="iceberg"``, scans the Iceberg table at
+    ``{path}/iceberg/{table_name}`` and ignores ``suffix``.
     """
-    file_path = str(path).removesuffix("/") + f"/{table_name}{suffix}"
-    return pl.scan_parquet(file_path)
+    root = str(path).removesuffix("/")
+    if input_format == "iceberg":
+        return pl.scan_iceberg(f"{root}/iceberg/{table_name}")
+    return pl.scan_parquet(f"{root}/{table_name}{suffix}")
 
 
-def _infer_scale_factor(name: str, path: str | Path, suffix: str) -> int | float:
+def _infer_scale_factor(
+    name: str, path: str | Path, suffix: str, input_format: InputFormat
+) -> int | float:
     if "pdsh" in name:
-        supplier = get_data(path, "supplier", suffix)
+        supplier = get_data(path, "supplier", suffix, input_format=input_format)
         num_rows = supplier.select(pl.len()).collect().item(0, 0)
         return num_rows / 10_000
 
     elif "pdsds" in name:
         # TODO: Keep a map of SF-row_count because of nonlinear scaling
         # See: https://www.tpc.org/TPC_Documents_Current_Versions/pdf/TPC-DS_v4.0.0.pdf pg.46
-        customer = get_data(path, "promotion", suffix)
+        customer = get_data(path, "promotion", suffix, input_format=input_format)
         num_rows = customer.select(pl.len()).collect().item(0, 0)
         return num_rows / 300
 
@@ -578,6 +592,7 @@ class RunConfig:
     dataset_path: str | Path
     scale_factor: int | float
     suffix: str
+    input_format: InputFormat = "parquet"
     qualification: bool = False
 
     # Execution mode
@@ -651,6 +666,22 @@ class RunConfig:
         if args.qualification and "pdsds" not in name:
             raise ValueError("--qualification can only be used with PDS-DS benchmarks.")
 
+        if args.input_format == "iceberg":
+            if "pdsds" in name:
+                raise ValueError(
+                    "--input-format iceberg is only supported for PDS-H benchmarks."
+                )
+            if args.debug:
+                raise ValueError(
+                    "--debug is not supported with --input-format iceberg; "
+                    "translating an Iceberg scan with --debug hangs."
+                )
+            if importlib.util.find_spec("pyiceberg") is None:
+                raise RuntimeError(
+                    "pyiceberg is not installed. "
+                    "Please install it to use --input-format iceberg."
+                )
+
         if scale_factor is None:
             if "pdsds" in name:
                 raise ValueError(
@@ -662,7 +693,9 @@ class RunConfig:
                     "Must specify --root and --scale if --path is not specified."
                 )
             # For PDS-H, infer scale factor based on row count
-            scale_factor = _infer_scale_factor(name, path, args.suffix)
+            scale_factor = _infer_scale_factor(
+                name, path, args.suffix, args.input_format
+            )
         if path is None:
             path = f"{args.root}/scale-{scale_factor}"
 
@@ -685,7 +718,7 @@ class RunConfig:
             and skip_scale_factor_inference is False
         ):
             # Validate the user-supplied scale factor
-            sf_inf = _infer_scale_factor(name, path, args.suffix)
+            sf_inf = _infer_scale_factor(name, path, args.suffix, args.input_format)
             rel_error = abs((scale_factor - sf_inf) / sf_inf)
             if rel_error > 0.01:
                 raise ValueError(
@@ -731,6 +764,7 @@ class RunConfig:
             dataset_path=path,
             scale_factor=scale_factor,
             suffix=args.suffix if args.suffix is not None else ".parquet",
+            input_format=args.input_format,
             qualification=args.qualification,
             frontend=args.frontend,
             iterations=args.iterations,
@@ -781,6 +815,7 @@ class RunConfig:
             "dataset_path": str(self.dataset_path),
             "scale_factor": self.scale_factor,
             "suffix": self.suffix,
+            "input_format": self.input_format,
             "qualification": self.qualification,
             "frontend": self.frontend,
             "iterations": self.iterations,
@@ -1988,7 +2023,12 @@ def check_input_data_type(
     else:
         table, col = "customer", "c_acctbal"
     t = (
-        get_data(run_config.dataset_path, table, run_config.suffix)
+        get_data(
+            run_config.dataset_path,
+            table,
+            run_config.suffix,
+            input_format=run_config.input_format,
+        )
         .select(pl.col(col))
         .collect_schema()[col]
     )
@@ -2004,7 +2044,12 @@ def check_input_data_type(
         date_type = "date"
     else:
         t = (
-            get_data(run_config.dataset_path, "orders", run_config.suffix)
+            get_data(
+                run_config.dataset_path,
+                "orders",
+                run_config.suffix,
+                input_format=run_config.input_format,
+            )
             .select(pl.col("o_orderdate"))
             .collect_schema()["o_orderdate"]
         )
@@ -2070,6 +2115,18 @@ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
             Default: .parquet"""),
     )
     parser.add_argument(
+        "--input-format",
+        dest="input_format",
+        type=str,
+        default="parquet",
+        choices=["parquet", "iceberg"],
+        help=textwrap.dedent("""\
+            Format of the input tables:
+                - parquet : Parquet files at {path}/{table}{suffix} (default)
+                - iceberg : Iceberg tables at {path}/iceberg/{table} (PDS-H only).
+                            --suffix is ignored."""),
+    )
+    parser.add_argument(
         "--io-mode",
         dest="io_mode",
         default="lukewarm",
@@ -2078,7 +2135,10 @@ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
             Cache state control for each timed iteration:
                 - cold     : Drop Linux page cache before each iteration (requires kvikio)
                 - lukewarm : Drop once before the first query, then let cache warm naturally (default)
-                - hot      : One untimed warmup iteration to populate cache before measured runs"""),
+                - hot      : One untimed warmup iteration to populate cache before measured runs
+            Page cache is dropped only for files under --path. With --input-format iceberg,
+            the manifests store absolute data file paths, so a copied dataset still reads
+            the original data files."""),
     )
     parser.add_argument(
         "--validation-abs-tol",
