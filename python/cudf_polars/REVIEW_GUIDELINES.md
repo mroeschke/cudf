@@ -103,33 +103,18 @@ async with shutdown_on_error(
     ...
 ```
 
-### Define cleanup targets before `try`, and offload with `ir_context.to_thread`
+### Offload blocking work with `ir_context.to_thread`
 
-Explicitly cancel every `asyncio.Task` in a `finally` block, so a failure
-does not leave tasks running. A `finally` block must not use names that are
-assigned inside the `try`. If
-the code fails early, the `finally` raises `NameError` and hides the real
-error. Run blocking or native work with `ir_context.to_thread`: it drains
-the future on cancellation and reuses the shared executor. Do not create
-new thread pools.
+Run blocking or native work from an actor with `ir_context.to_thread`. It
+reuses the shared executor and drains the future on cancellation. Do not
+create new thread pools or call `loop.run_in_executor` directly.
 
 ```python
-# Bad
-try:
-    tasks = [asyncio.create_task(f(x)) for x in xs]
-    await asyncio.gather(*tasks)
-finally:
-    for t in tasks:  # NameError if create_task raised
-        t.cancel()
+# Bad: a new pool per call, and the future is not drained on cancellation
+with ThreadPoolExecutor() as pool:
+    result = await loop.run_in_executor(pool, ir.do_evaluate, *args)
 
 # Good
-tasks: list[asyncio.Task] = []
-try:
-    ...
-finally:
-    for t in tasks:
-        t.cancel()
-
 result = await ir_context.to_thread(ir.do_evaluate, *args, context=ir_context)
 ```
 
