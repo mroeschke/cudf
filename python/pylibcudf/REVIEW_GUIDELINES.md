@@ -28,16 +28,13 @@ def set_filter(self, Expression filter):
 Sub-views of device memory, such as `gpumemoryview` slices, must also keep a
 reference to the owner and clamp bounds to the buffer size.
 
-Report incorrect Cython object lifetime or ownership between the Python and
-C++ layers, such as a missing `del` or a wrong reference count, as CRITICAL.
-
 ### Name host data passed to asynchronous copies
 
 `rmm.DeviceBuffer.to_device` and other asynchronous memory copy APIs copy
 on a non-default stream. Keep a Python reference to the host data alive
 until the copy finishes. Watch for temporaries: slicing `bytes` makes a
 copy, and `to_pybytes()` returns a new object. Either can be freed before
-the copy finishes. This applies to tests too. Report this as CRITICAL.
+the copy finishes. This applies to tests too.
 
 ```python
 # Bad: buf[4:] is a temporary copy that can be freed during the copy
@@ -127,10 +124,10 @@ conversion and validation is complete.
 ### Release the GIL around IO setup and large metadata copies
 
 Creating a datasource (`make_datasources`, file or S3 access) and copying
-large C++ structs such as `FileMetaData` also need `with nogil:`. cudf_polars
-calls these from thread pools, so holding the GIL there serializes the
-threads. When cudf_polars needs per-row-group or per-column-chunk data, add
-a bulk accessor instead of a Python loop.
+large C++ structs such as `FileMetaData` also need `with nogil:`. Callers
+run these from thread pools, so holding the GIL there serializes the
+threads. When callers need per-row-group or per-column-chunk data, add a
+bulk accessor instead of a Python loop.
 
 ```cython
 # Bad: one Python call per row group, GIL held for each copy
@@ -156,22 +153,6 @@ size_type num_rows(...) noexcept   # calls a function that can throw
 
 # Good
 int64_t count(...) except +libcudf_exception_handler
-```
-
-### Use the limited C API and count references correctly
-
-Use only the Python limited (stable) C API. `PyList_SetItem` and
-`PyTuple_SetItem` steal a reference, so a borrowed object needs `Py_INCREF`
-first. Prefer the declarations Cython ships (`cpython.*`, `libcpp.*`) over
-hand-written `extern` blocks.
-
-```cython
-# Bad: non-limited macro, and steals a borrowed reference
-PyList_SET_ITEM(out, i, item)
-
-# Good
-Py_INCREF(item)
-PyList_SetItem(out, i, item)
 ```
 
 ### Use checked casts on untyped arguments
@@ -228,104 +209,13 @@ in an anonymous namespace with its own `#include`s.
 cdef extern from "cudf/detail/utilities/vector_factories.hpp" ...
 ```
 
-### Add an option instead of changing a default for Polars semantics
-
-When cudf_polars needs Polars behavior that differs from cudf or pandas
-behavior, add a new libcudf/pylibcudf option. Do not change the existing
-default.
-
-```cpp
-// Bad: changes rounding for every cudf user
-case interpolation::NEAREST: return round(val);  // was nearbyint (half-to-even)
-
-// Good: a new enum value that cudf_polars selects
-enum class interpolation : int32_t { ..., NEAREST, NEAREST_HALF_UP };
-```
-
-```python
-# cudf_polars
-plc.quantiles.quantile(col, [q], plc.types.Interpolation.NEAREST_HALF_UP, stream=stream)
-```
-
-## Tables, Columns, and Scalars
-
-### Pass `num_rows` when a table may have no columns
-
-`plc.Table(columns)` with an empty list builds a table with 0 rows. It also
-does not check that the columns have equal lengths. cudf_polars depends on
-that, so do not add the check to the default path.
-
-```python
-# Bad: a projection that selects no columns loses the row count
-table = plc.Table([c.obj for c in columns])
-
-# Good
-table = plc.Table([c.obj for c in columns], num_rows=num_rows)
-```
-
-### Scalar conversions keep `inf`, NaN, decimal scale, and temporal types correct
-
-- `Scalar.from_py` range checks must let `inf`, `-inf`, and NaN through for
-  floating-point types.
-- Fixed-point scalars must carry the target dtype's scale.
-- `Scalar.to_py` does not support timestamps or durations. Bit-cast to the
-  integer storage type first.
-
-```python
-# Bad: a decimal literal built with scale 0 compares wrongly with a scale -2 column
-plc.Scalar.from_py(Decimal("1.25"), plc.DataType(plc.TypeId.DECIMAL64))
-
-# Good
-plc.Scalar.from_py(Decimal("1.25"), plc.DataType(plc.TypeId.DECIMAL64, -2))
-```
-
-### Reject input that pylibcudf cannot represent
-
-Constructors that take Python iterables or array-interface objects must
-raise on fields they do not support (for example `mask`), and must
-validate every nested branch, not only the first.
-
-```python
-# Bad: ignores the mask, so masked values come back as valid data
-def from_array_interface(obj):
-    iface = obj.__cuda_array_interface__
-    return _build(iface["data"], iface["shape"], iface["typestr"])
-
-# Good
-if iface.get("mask") is not None:
-    raise NotImplementedError("Masked array interfaces are not supported")
-```
-
-### Support `__cuda_array_interface__` and keep array attributes
-
-Support `__cuda_array_interface__` for interoperability with CuPy and
-PyTorch. Handle the different array types (CuPy, Numba `DeviceNDArray`),
-and preserve array attributes where appropriate.
-
 ## API Stability
-
-### Deprecate released bindings before removing or renaming them
-
-Add the new name, keep the old one as a wrapper that emits a
-`FutureWarning` for one release, and update the call sites in cudf and
-cudf_polars. Behavior changes, new required parameters, and changed return
-types need the `breaking` label. Unreleased and `experimental` APIs are
-exempt.
-
-```python
-def apply_boolean_mask(source, mask, stream=None, mr=None):
-    warnings.warn(
-        "apply_boolean_mask is deprecated, use apply_retention_mask",
-        FutureWarning,
-    )
-    return apply_retention_mask(source, mask, stream=stream, mr=mr)
-```
 
 ### New `cdef class` fields in a `.pxd` change the ABI
 
 Adding or reordering attributes on a public `cdef class` in a `.pxd`
-changes its C layout. That breaks downstream packages that `cimport` it,
-such as rapidsmpf. Flag it as an ABI change.
+changes its C layout. That breaks downstream packages that `cimport` it.
+Flag it as an ABI change.
 
 ## Type Stubs and Docstrings
 
@@ -346,35 +236,4 @@ def concatenate(
     stream: CudaStreamLike | None = None,
     mr: DeviceMemoryResource | None = None,
 ) -> Table: ...
-```
-
-## Testing
-
-### Test the binding plumbing with the shared helpers
-
-Every new binding needs a test that calls each function and overload. Test
-the binding (arguments passed through, types, errors), not libcudf's
-algorithm again. Compare with `assert_column_eq` and `assert_table_eq` from
-`tests/common/utils.py`. Add the test to the existing
-`tests/test_<module>.py` file instead of a new themed file.
-
-```python
-# Good
-def test_replace_nulls_scalar(input_column):
-    got = plc.replace.replace_nulls(input_column, plc.Scalar.from_py(0))
-    expect = pa.compute.fill_null(plc_to_arrow(input_column), 0)
-    assert_column_eq(expect, got)
-```
-
-### Parquet filter and IO tests check the symptom and the pruning edge cases
-
-Bug-fix tests must assert the affected quantity, not only round-trip
-equality. Parquet filter tests must cover NaN bounds, decimal scale
-mismatch, negative values, and physical-type mismatch, because wrong
-pruning drops rows silently. Raw buffer and bitmask code needs tests with
-multi-byte UTF-8, nulls, empty input, slices, and more than 8 rows.
-
-```python
-@pytest.mark.parametrize("values", [[1.0, float("nan")], [-5, -1], [Decimal("1.10")]])
-def test_filter_keeps_matching_rows(values, tmp_path): ...
 ```

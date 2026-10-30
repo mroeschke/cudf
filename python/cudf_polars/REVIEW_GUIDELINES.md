@@ -11,8 +11,8 @@ Code examples are simplified mock code. Always report violations in this guide.
 ### Pass `stream` to every pylibcudf call
 
 Every pylibcudf call must pass a `stream` argument explicitly. Do not use
-the default `stream` argument of pylibcudf APIs. Report a missing `stream`
-as CRITICAL. This also covers calls that do not look like kernels:
+the default `stream` argument of pylibcudf APIs. This also covers calls
+that do not look like kernels:
 `Scalar.to_py`, `Scalar.from_py`, `Column.obj_scalar`, `Column.astype`,
 and `plc.Table.from_arrow`.
 
@@ -499,20 +499,12 @@ Op, Col = plc.expressions.Operation, plc.expressions.ColumnReference
 ast_op = plc.expressions.ASTOperator
 expr = Op(ast_op.ADD, Op(ast_op.ABS, Op(ast_op.MUL, Col(0), Col(1))), Col(2))
 out = plc.transform.compute_column(plc.Table([a, b, c]), expr, stream=stream)
-
-# Bad
-n = plc.stream_compaction.distinct(tbl, keys, ..., stream=stream).num_rows()
-
-# Good
-n = plc.reduce.distinct_count(
-    col, plc.types.NullPolicy.INCLUDE, plc.types.NanPolicy.NAN_IS_VALID, stream=stream
-)
 ```
 
 ### Do not convert to pyarrow
 
 Do not convert pylibcudf or Polars objects to pyarrow objects, for example
-with a `to_arrow` method. Report this as CRITICAL.
+with a `to_arrow` method.
 
 ```python
 # Bad
@@ -572,13 +564,6 @@ class StreamingExecutor:
     )
 ```
 
-### Options, environment variables, and benchmark flags are public
-
-Moving, renaming, removing, or changing the default of an option, its
-`CUDF_POLARS__*` environment variable, or a benchmark CLI flag is a breaking
-change. `cudf_polars.experimental` is exempt. Delete an option that
-nothing uses; do not keep it as a no-op that warns.
-
 ### Do not change process-global state
 
 Library and engine code must not set `os.environ`, change third-party
@@ -618,21 +603,6 @@ executor_options = {k: v for k, v in executor_options.items() if k != "cluster"}
 - Dask: `Client.scheduler_info()` needs `n_workers=-1`; by default it
   reports at most 5 workers.
 
-### Risky or costly features are explicit opt-in
-
-GPU sharing between ranks, tracing, telemetry, and expensive diagnostics
-need their own opt-in flag. They must cost almost nothing when disabled.
-Trace payloads must be bounded; do not record full lists of file paths.
-
-```python
-# Bad: does work even when tracing is off
-tracer.record(plan=explain(ir))
-
-# Good (illustrative tracer API)
-if tracer.enabled:
-    tracer.record(plan=explain(ir))
-```
-
 ## Dependencies and Polars Versions
 
 ### Optional dependencies stay optional
@@ -641,43 +611,7 @@ if tracer.enabled:
 other optional packages. Keep `except ImportError` narrow. Tests that fake
 a missing package by changing `sys.modules` must run in a subprocess.
 
-```python
-# Bad: also hides real errors inside the module
-try:
-    from cudf_polars.engines.ray import RayEngine
-except Exception:
-    RayEngine = None
-```
-
-### Gate version-specific code with `POLARS_VERSION_LT_*`
-
-Use the `POLARS_VERSION_LT_*` constants, not `hasattr` probes. Put
-parentheses around version-gated conditional expressions. When Polars is
-upgraded, update the compatibility test matrix.
-
-```python
-# Bad: parses as (x == "A") if ... else "B", and "B" is always truthy
-if x == "A" if POLARS_VERSION_LT_21 else "B":
-
-# Good
-if x == ("A" if POLARS_VERSION_LT_21 else "B"):
-```
-
 ## Testing
-
-### Tests must exercise the path they claim
-
-Use input that triggers the path under test: more than one partition,
-chunk, or rank, and expressions that are not pointwise. State expected
-values explicitly. A regression test must fail without the fix.
-
-```python
-# Bad: one partition, so the shuffle path is never run
-q = pl.LazyFrame({"a": [1, 2, 3]}).group_by("a").agg(pl.len())
-
-# Good
-engine = streaming_engine_factory(StreamingOptions(max_rows_per_partition=1))
-```
 
 ### Do not hide row-order differences
 
@@ -720,50 +654,4 @@ def test_join():
 # Good
 def test_join(engine):
     assert_gpu_result_equal(q, engine=engine)
-```
-
-### Test through public Polars APIs
-
-Compare against CPU Polars with `assert_gpu_result_equal` on a `LazyFrame`
-query. Avoid hand-built expected frames and tests that drive internal IR
-objects. Cover every dtype the Polars docs list for the expression, every
-invalid argument Polars rejects, and, for `dt.*`, times that are not
-midnight and dates before 1970.
-
-## Benchmarks
-
-### PDS-H and PDS-DS ports match the reference SQL
-
-Check parameters, `DISTINCT`, empty-sum `NULL`, null ordering, rank method,
-and semi-joins against the reference SQL. Ask for validation results at
-nightly scale factors. A validation workaround needs a unit-test
-reproducer. Benchmark modules must import without GPU packages and handle
-remote paths.
-
-```python
-# Bad: SQL SUM over no rows is NULL, Polars sum is 0
-.agg(pl.col("x").sum())
-
-# Good
-.agg(pl.when(pl.col("x").count() > 0).then(pl.col("x").sum()))
-```
-
-## Workarounds and Defensive Code
-
-### Link an issue, and ask what the workaround hides
-
-Every workaround, xfail, or skip (including in `inject_gpu_engine.py`)
-needs a tracking issue. A workaround for a libcudf limitation needs a
-libcudf issue, and it must be removed once libcudf adds the feature. Ask
-for the root cause of defensive code (re-sorting, redundant casts, `None`
-checks). States that only malformed IR can reach should `assert`, not fall
-back.
-
-```python
-# Bad
-if result is None:  # should never happen
-    return df
-
-# Good
-assert result is not None, "lowering always produces a result"
 ```
