@@ -1,6 +1,6 @@
 # cudf_polars Review Guidelines
 
-These guidelines apply only to `python/cudf_polars`. They compliment
+These guidelines apply only to `python/cudf_polars`. They complement
 `python/REVIEW_GUIDELINES.md` as library specific guidelines.
 
 Use the severity labels from `python/REVIEW_GUIDELINES.md` when you comment.

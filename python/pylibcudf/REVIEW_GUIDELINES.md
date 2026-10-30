@@ -1,6 +1,6 @@
 # pylibcudf Review Guidelines
 
-These guidelines apply only to `python/pylibcudf`. They compliment
+These guidelines apply only to `python/pylibcudf`. They complement
 `python/REVIEW_GUIDELINES.md` as library specific guidelines.
 
 Use the severity labels from `python/REVIEW_GUIDELINES.md` when you comment.
