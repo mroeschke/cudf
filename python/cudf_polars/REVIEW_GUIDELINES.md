@@ -8,11 +8,13 @@ Code examples are simplified mock code. Always report violations in this guide.
 
 ## CUDA Streams
 
-### Pass `stream` to accessor-like pylibcudf calls too
+### Pass `stream` to every pylibcudf call
 
-The rule "always pass `stream`" also covers calls that do not look like
-kernels: `Scalar.to_py`, `Scalar.from_py`, `Column.obj_scalar`,
-`Column.astype`, and `plc.Table.from_arrow`.
+Every pylibcudf call must pass a `stream` argument explicitly. Do not use
+the default `stream` argument of pylibcudf APIs. Report a missing `stream`
+as CRITICAL. This also covers calls that do not look like kernels:
+`Scalar.to_py`, `Scalar.from_py`, `Column.obj_scalar`, `Column.astype`,
+and `plc.Table.from_arrow`.
 
 ```python
 # Bad: these silently use the default stream
@@ -103,7 +105,9 @@ async with shutdown_on_error(
 
 ### Define cleanup targets before `try`, and offload with `ir_context.to_thread`
 
-A `finally` block must not use names that are assigned inside the `try`. If
+Explicitly cancel every `asyncio.Task` in a `finally` block, so a failure
+does not leave tasks running. A `finally` block must not use names that are
+assigned inside the `try`. If
 the code fails early, the `finally` raises `NameError` and hides the real
 error. Run blocking or native work with `ir_context.to_thread`: it drains
 the future on cancellation and reuses the shared executor. Do not create
@@ -364,6 +368,26 @@ if left_count == 1 or right_count == 1:
   metadata is `duplicated`. The other ranks must still drain their input.
 - Multi-rank sinks write to a directory, not a single file path.
 
+## Translation and CPU Fallback
+
+### GPU results must match CPU Polars
+
+Every Polars IR node and expression that the translator accepts must
+produce the same result on the GPU as on CPU Polars. Report an IR
+translation that produces wrong results as CRITICAL.
+
+### Unsupported operations fall back cleanly
+
+Polars IR nodes and expression types that the GPU executor does not
+support must raise `NotImplementedError` during translation, so the query
+falls back to CPU with a warning. They must not fall back silently, and
+they must not produce wrong results. Check that the fallback logic sends
+only the unsupported cases to CPU.
+
+### No Cython
+
+cudf_polars is pure Python. Add any Cython bindings it needs to pylibcudf.
+
 ## Lowering and IR Structure
 
 ### Keep row alignment in streaming decomposition
@@ -526,6 +550,19 @@ n = plc.stream_compaction.distinct(tbl, keys, ..., stream=stream).num_rows()
 n = plc.reduce.distinct_count(
     col, plc.types.NullPolicy.INCLUDE, plc.types.NanPolicy.NAN_IS_VALID, stream=stream
 )
+```
+
+### Do not convert to pyarrow
+
+Do not convert pylibcudf or Polars objects to pyarrow objects, for example
+with a `to_arrow` method. Report this as CRITICAL.
+
+```python
+# Bad
+col = plc.Column.from_arrow(series.to_arrow(), stream=stream)
+
+# Good
+col = plc.Column.from_arrow(series, stream=stream)
 ```
 
 ### No per-chunk host round-trips or identity GPU work
@@ -737,9 +774,10 @@ def test_join(engine):
 
 Compare against CPU Polars with `assert_gpu_result_equal` on a `LazyFrame`
 query. Avoid hand-built expected frames and tests that drive internal IR
-objects. Cover every dtype the Polars docs list for the expression, every
-invalid argument Polars rejects, and, for `dt.*`, times that are not
-midnight and dates before 1970.
+objects. Cover every supported expression type, every dtype the Polars
+docs list for the expression, every invalid argument Polars rejects, and,
+for `dt.*`, times that are not midnight and dates before 1970. Test the
+fallback behavior of unsupported operations.
 
 ## Benchmarks
 

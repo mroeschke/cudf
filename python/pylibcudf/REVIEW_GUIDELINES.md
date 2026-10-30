@@ -28,12 +28,16 @@ def set_filter(self, Expression filter):
 Sub-views of device memory, such as `gpumemoryview` slices, must also keep a
 reference to the owner and clamp bounds to the buffer size.
 
+Report incorrect Cython object lifetime or ownership between the Python and
+C++ layers, such as a missing `del` or a wrong reference count, as CRITICAL.
+
 ### Name host data passed to asynchronous copies
 
-`rmm.DeviceBuffer.to_device` copies asynchronously on a non-default stream.
-Watch for temporaries: slicing `bytes` makes a copy, and `to_pybytes()`
-returns a new object. Either can be freed before the copy finishes. This
-applies to tests too.
+`rmm.DeviceBuffer.to_device` and other asynchronous memory copy APIs copy
+on a non-default stream. Keep a Python reference to the host data alive
+until the copy finishes. Watch for temporaries: slicing `bytes` makes a
+copy, and `to_pybytes()` returns a new object. Either can be freed before
+the copy finishes. This applies to tests too. Report this as CRITICAL.
 
 ```python
 # Bad: buf[4:] is a temporary copy that can be freed during the copy
@@ -106,9 +110,10 @@ Use the `patch_cupy_stream` fixture instead of bare `cp.asarray(...)`.
 
 ### Build C++ values before `with nogil:`
 
-`.view()`, `.mutable_view()`, and conversion of Python containers to C++
-vectors need the GIL. Do them first and store the results in typed `cdef`
-locals. Code that triggers a Cython "performance hint" fails the CI build.
+Run long-running libcudf calls inside `with nogil:`, after all Python object
+conversion and validation is complete. `.view()`, `.mutable_view()`, and
+conversion of Python containers to C++ vectors need the GIL. Do them first
+and store the results in typed `cdef` locals. Code that triggers a Cython "performance hint" fails the CI build.
 Do not silence the hint by marking a throwing function `noexcept`.
 
 ```cython
@@ -122,6 +127,19 @@ cdef column_view c_map = gather_map.view()
 with nogil:
     c_result = cpp_copying.gather(c_source, c_map, bounds_policy, _cs, mr.get_mr())
 ```
+
+### Keep Python objects and Python locks out of `with nogil:`
+
+- Do not access Python objects, call Python callbacks, or allocate
+  Python-owned objects inside `with nogil:` blocks.
+- Do not hold Python-level locks while entering `with nogil:` libcudf calls
+  that may allocate device memory or synchronize CUDA work.
+- Watch for lock-order inversions: one path holds the GIL while it waits
+  for CUDA or RMM state, and another path holds CUDA or RMM state while it
+  tries to reacquire the GIL.
+- If a binding must reacquire the GIL after it launches CUDA work, check
+  that the work is ordered on the provided stream and that no
+  Python-visible object can see partially completed device state.
 
 ### Release the GIL around IO setup and large metadata copies
 
@@ -188,8 +206,9 @@ tbl = <Table?>obj
 
 ### Names, defaults, and struct shapes mirror libcudf
 
-Function, enum, parameter names, and defaults must match libcudf. Wrapper
-classes should follow the shape of the libcudf struct they wrap.
+Cython bindings must match the C++ API signatures and semantics. Function,
+enum, parameter names, and defaults must match libcudf. Wrapper classes
+should follow the shape of the libcudf struct they wrap.
 
 ```python
 # Bad: name and default differ from cudf::make_empty_lists_column
@@ -297,6 +316,12 @@ def from_array_interface(obj):
 if iface.get("mask") is not None:
     raise NotImplementedError("Masked array interfaces are not supported")
 ```
+
+### Support `__cuda_array_interface__` and keep array attributes
+
+Support `__cuda_array_interface__` for interoperability with CuPy and
+PyTorch. Handle the different array types (CuPy, Numba `DeviceNDArray`),
+and preserve array attributes where appropriate.
 
 ## API Stability
 
