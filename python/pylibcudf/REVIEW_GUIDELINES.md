@@ -108,30 +108,13 @@ Use the `patch_cupy_stream` fixture instead of bare `cp.asarray(...)`.
 
 ## GIL and `nogil` Blocks
 
-### Build C++ values before `with nogil:`
+### Run long-running libcudf calls inside `with nogil:`
 
 Run long-running libcudf calls inside `with nogil:`, after all Python object
-conversion and validation is complete. `.view()`, `.mutable_view()`, and
-conversion of Python containers to C++ vectors need the GIL. Do them first
-and store the results in typed `cdef` locals. Code that triggers a Cython "performance hint" fails the CI build.
-Do not silence the hint by marking a throwing function `noexcept`.
+conversion and validation is complete.
 
-```cython
-# Bad: Python attribute access and conversion inside nogil
-with nogil:
-    c_result = cpp_copying.gather(source_table.view(), gather_map.view(), ...)
+### Keep Python locks out of `with nogil:`
 
-# Good
-cdef table_view c_source = source_table.view()
-cdef column_view c_map = gather_map.view()
-with nogil:
-    c_result = cpp_copying.gather(c_source, c_map, bounds_policy, _cs, mr.get_mr())
-```
-
-### Keep Python objects and Python locks out of `with nogil:`
-
-- Do not access Python objects, call Python callbacks, or allocate
-  Python-owned objects inside `with nogil:` blocks.
 - Do not hold Python-level locks while entering `with nogil:` libcudf calls
   that may allocate device memory or synchronize CUDA work.
 - Watch for lock-order inversions: one path holds the GIL while it waits
@@ -217,10 +200,6 @@ def empty_list_column(child_type=None): ...
 # Good: same name and parameters as libcudf
 def make_empty_lists_column(DataType child_type, stream=None, mr=None): ...
 ```
-
-Enums that have no C++ "see also" entry must be added to
-`_enums_without_cpp_see_also` in `docs/cudf/source/conf.py`, or the docs
-build fails.
 
 ### Update every mirror when a libcudf enum or signature changes
 

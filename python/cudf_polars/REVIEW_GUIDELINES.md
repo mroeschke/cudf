@@ -133,8 +133,6 @@ finally:
 result = await ir_context.to_thread(ir.do_evaluate, *args, context=ir_context)
 ```
 
-Use `gather_in_task_group` instead of `asyncio.gather` in actors.
-
 ### Keep message sequence numbers
 
 Actors that buffer or replay messages must keep the input
@@ -368,25 +366,13 @@ if left_count == 1 or right_count == 1:
   metadata is `duplicated`. The other ranks must still drain their input.
 - Multi-rank sinks write to a directory, not a single file path.
 
-## Translation and CPU Fallback
+## Translation
 
 ### GPU results must match CPU Polars
 
 Every Polars IR node and expression that the translator accepts must
 produce the same result on the GPU as on CPU Polars. Report an IR
 translation that produces wrong results as CRITICAL.
-
-### Unsupported operations fall back cleanly
-
-Polars IR nodes and expression types that the GPU executor does not
-support must raise `NotImplementedError` during translation, so the query
-falls back to CPU with a warning. They must not fall back silently, and
-they must not produce wrong results. Check that the fallback logic sends
-only the unsupported cases to CPU.
-
-### No Cython
-
-cudf_polars is pure Python. Add any Cython bindings it needs to pylibcudf.
 
 ## Lowering and IR Structure
 
@@ -620,8 +606,7 @@ class StreamingExecutor:
 Moving, renaming, removing, or changing the default of an option, its
 `CUDF_POLARS__*` environment variable, or a benchmark CLI flag is a breaking
 change. `cudf_polars.experimental` is exempt. Delete an option that
-nothing uses; do not keep it as a no-op that warns. A default config must
-not emit deprecation warnings.
+nothing uses; do not keep it as a no-op that warns.
 
 ### Do not change process-global state
 
@@ -697,9 +682,7 @@ except Exception:
 
 Use the `POLARS_VERSION_LT_*` constants, not `hasattr` probes. Put
 parentheses around version-gated conditional expressions. When Polars is
-upgraded, raise the translator IR version gate and update the
-compatibility test matrix. Version-specific xfails need a precise guard,
-or they become XPASS failures.
+upgraded, update the compatibility test matrix.
 
 ```python
 # Bad: parses as (x == "A") if ... else "B", and "B" is always truthy
@@ -715,9 +698,7 @@ if x == ("A" if POLARS_VERSION_LT_21 else "B"):
 
 Use input that triggers the path under test: more than one partition,
 chunk, or rank, and expressions that are not pointwise. State expected
-values explicitly. A regression test must fail without the fix. Check the
-coverage you lose when you change a test's engine or remove
-parametrizations.
+values explicitly. A regression test must fail without the fix.
 
 ```python
 # Bad: one partition, so the shuffle path is never run
@@ -774,10 +755,9 @@ def test_join(engine):
 
 Compare against CPU Polars with `assert_gpu_result_equal` on a `LazyFrame`
 query. Avoid hand-built expected frames and tests that drive internal IR
-objects. Cover every supported expression type, every dtype the Polars
-docs list for the expression, every invalid argument Polars rejects, and,
-for `dt.*`, times that are not midnight and dates before 1970. Test the
-fallback behavior of unsupported operations.
+objects. Cover every dtype the Polars docs list for the expression, every
+invalid argument Polars rejects, and, for `dt.*`, times that are not
+midnight and dates before 1970.
 
 ## Benchmarks
 
