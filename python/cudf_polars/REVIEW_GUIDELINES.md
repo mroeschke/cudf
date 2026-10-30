@@ -476,9 +476,7 @@ dtype or 64-bit integers.
 
 ### Zero rows and zero columns
 
-`do_evaluate` must work on 0-row input. Return
-`make_empty_column(dtype, stream)` instead of calling `.to_py()` on a null
-reduction result. Results with zero columns must keep `num_rows`.
+`do_evaluate` must work on 0-row input. Results with zero columns must keep `num_rows`.
 
 ## Efficient pylibcudf Use
 
@@ -491,6 +489,17 @@ reduction result. Results with zero columns must keep `num_rows`.
 - Do cheap host-side checks (null count, dtype) before launching kernels.
 
 ```python
+# Bad: three kernels and two full-size intermediate columns for abs(a * b) + c
+ab = plc.binaryop.binary_operation(a, b, plc.binaryop.BinaryOperator.MUL, dtype, stream=stream)
+abs_ab = plc.unary.unary_operation(ab, plc.unary.UnaryOperator.ABS, stream=stream)
+out = plc.binaryop.binary_operation(abs_ab, c, plc.binaryop.BinaryOperator.ADD, dtype, stream=stream)
+
+# Good: one AST, evaluated in one kernel
+Op, Col = plc.expressions.Operation, plc.expressions.ColumnReference
+ast_op = plc.expressions.ASTOperator
+expr = Op(ast_op.ADD, Op(ast_op.ABS, Op(ast_op.MUL, Col(0), Col(1))), Col(2))
+out = plc.transform.compute_column(plc.Table([a, b, c]), expr, stream=stream)
+
 # Bad
 n = plc.stream_compaction.distinct(tbl, keys, ..., stream=stream).num_rows()
 
