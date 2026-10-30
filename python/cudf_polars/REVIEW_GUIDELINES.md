@@ -10,8 +10,9 @@ Code examples are simplified mock code. Always report violations in this guide.
 
 ### Pass `stream` to every pylibcudf call
 
-Every pylibcudf call must pass a `stream` argument explicitly. Do not use
-the default `stream` argument of pylibcudf APIs. This also covers calls
+Every pylibcudf operation that accepts a `stream` argument and can enqueue or
+synchronize device work must receive that argument explicitly. Do not rely on
+the default stream for those operations. This also covers calls
 that do not look like kernels:
 `Scalar.to_py`, `Scalar.from_py`, `Column.obj_scalar`, `Column.astype`,
 and `plc.Table.from_arrow`.
@@ -407,9 +408,10 @@ limit chunk size and then concatenate all the per-chunk results anyway.
 
 ### Validate at translation time
 
-Expression `__init__` must reject input dtypes and literal arguments that
-the GPU path does not support, or that CPU Polars rejects, with
-`NotImplementedError`. A check in `do_evaluate` is too late: it causes
+Expression `__init__` must reject input dtypes and literal arguments that the
+GPU path does not support, but CPU Polars accepts, with `NotImplementedError`.
+Inputs that CPU Polars rejects must raise the corresponding CPU-compatible
+exception. A check in `do_evaluate` is too late: it causes
 silent casts, libcudf `logic_error`s, or device-to-host copies. Do not
 assume an argument is a `Literal` when Polars allows any expression.
 

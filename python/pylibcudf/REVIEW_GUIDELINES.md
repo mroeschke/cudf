@@ -61,7 +61,8 @@ assert ref() is not None  # view must keep the owner alive
 
 ### New APIs take `stream` and `mr`
 
-Every new `cpdef` API takes `stream`. If it allocates, it also takes `mr` and
+Every new `cpdef` API that launches device work or allocates device memory takes
+`stream`. If it allocates memory for returned objects, it also takes `mr` and
 binds the libcudf overload that accepts a memory resource.
 
 ```cython
