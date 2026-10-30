@@ -297,11 +297,10 @@ if partitioning_matches(meta.partitioning, keys=ir.keys, strict=True):
 ### Propagate sortedness flags only when the operation keeps the order
 
 - Call `set_sorted`/`sorted_like` only on results of order-preserving
-  operations; `replace` is not one of them.
+  operations.
 - Flag a result of an order-preserving operation, such as a filter, a
   slice, or a copy, that drops the sortedness of its input when it could
-  keep it with `sorted_like`. Polars uses these flags for faster
-  algorithms.
+  keep it with `sorted_like`.
 
 ```python
 # Bad: replace can break the order
@@ -359,15 +358,13 @@ if left_count == 1 or right_count == 1:
   collectives.
 - Sink, write, and callback actors must act on one rank only when the input
   metadata is `duplicated`. The other ranks must still drain their input.
-- Multi-rank sinks write to a directory, not a single file path.
 
 ## Translation
 
 ### GPU results must match CPU Polars
 
 Every Polars IR node and expression that the translator accepts must
-produce the same result on the GPU as on CPU Polars. Report an IR
-translation that produces wrong results as CRITICAL.
+produce the same result on the GPU as on CPU Polars.
 
 ## Lowering and IR Structure
 
@@ -431,37 +428,7 @@ def __init__(self, dtype, name, options, *children):
 ### Unsupported is not the same as invalid
 
 Unknown plan variants, options, and dtypes must raise
-`NotImplementedError` at translation, not `AttributeError` or a libcudf
-error. Invalid operations must raise the same exception as CPU Polars. A
-dtype emulated with another libcudf type (`pl.Array`, `pl.Time`) must
-reject every consumer that is not tested (cast, literal, join key, group
-key).
-
-### NaN and null are different
-
-- Mask NaNs with `Column.mask_nans` before libcudf comparison reductions
-  (`argmin`, `argmax`, min/max-by).
-- Ratio decompositions (`sum / count`) must return null, not NaN, when the
-  count is 0.
-- Convert libcudf null results to NaN where Polars returns NaN (`corr`).
-- Host-side finalization must return NaN where Polars does, not raise
-  `ZeroDivisionError`.
-
-```python
-# Bad: NaN is treated as the largest value
-idx = plc.reduce.reduce(col.obj, plc.aggregation.argmax(), ..., stream=stream)
-
-# Good
-col = col.mask_nans(stream)
-```
-
-### Null-based rewrites need an allowlist
-
-A rewrite that replaces filtered or NaN values with null before an
-aggregation is valid only for aggregations that ignore nulls. It is not
-valid for `first(ignore_nulls=False)`, `null_count`, or `len`. Test
-expressions with key, value, or option arguments (`replace`, `fill_null`)
-with nulls in each argument separately.
+`NotImplementedError` at translation. Invalid operations must raise the same exception as CPU Polars.
 
 ### Broadcast scalars correctly
 
@@ -496,8 +463,8 @@ match. Never label a buffer with a type of a different width.
 # Bad: labels an INT32 result as the Polars index dtype (UInt32/UInt64)
 return Column(result, dtype=self.dtype)
 
-# Also bad: relabels INT64 data as TIMESTAMP_DAYS (INT32 storage)
-plc.Column(plc.DataType(plc.TypeId.TIMESTAMP_DAYS), size, data, ...)
+# Also bad: calls pylibcudf directly instead of Column.astype
+plc.unary.cast(result, self.dtype.plc_type, stream=stream)
 
 # Good
 return Column(result, dtype=DataType(...)).astype(self.dtype, stream)
