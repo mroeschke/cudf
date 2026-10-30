@@ -289,16 +289,26 @@ if partitioning_matches(meta.partitioning, keys=ir.keys, strict=True):
 ### Ordering and sortedness claims must be provable
 
 - Mark an `Ordering` strict only if the boundaries are unique.
-- Call `set_sorted`/`sorted_like` only on results of order-preserving
-  operations; `replace` is not one of them.
 - Assemble ordered partitions by concatenating key-range-ordered chunks,
   not with a merge that can reorder equal keys.
 - Utilities that depend on ordering must raise when the requested ordering
   is not met.
 
+### Propagate sortedness flags only when the operation keeps the order
+
+- Call `set_sorted`/`sorted_like` only on results of order-preserving
+  operations; `replace` is not one of them.
+- Flag a result of an order-preserving operation, such as a filter, a
+  slice, or a copy, that drops the sortedness of its input when it could
+  keep it with `sorted_like`. Polars uses these flags for faster
+  algorithms.
+
 ```python
 # Bad: replace can break the order
 return Column(result, name=col.name).sorted_like(col)
+
+# Bad: a filter keeps the order, but the result loses the sorted flag
+return Column(filtered, name=col.name)
 
 # Good: propagate only through order-preserving operations
 return Column(col.obj.copy(), name=col.name).sorted_like(col)
