@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 from contextlib import AbstractContextManager, nullcontext
 from functools import singledispatch
@@ -40,7 +41,7 @@ from cudf_polars.utils import config, sorting
 from cudf_polars.utils.uri import strip_file_uri
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Sequence
+    from collections.abc import Generator, Iterable, Sequence
 
     from polars import GPUEngine
 
@@ -1263,6 +1264,42 @@ def _contains_time_input(node: expr.Expr) -> bool:
     )
 
 
+def _format_input_as_string(child: expr.Expr, dtype: DataType) -> expr.Expr:
+    if child.dtype.id() == plc.TypeId.STRING:
+        return child
+    if isinstance(child, expr.Literal):
+        return child.astype(dtype)
+    if child.dtype.id() in {plc.TypeId.FLOAT32, plc.TypeId.FLOAT64}:
+        raise NotImplementedError(
+            "Casting float columns to string does not match polars formatting"
+        )
+    return expr.Cast(dtype, True, child)  # noqa: FBT003
+
+
+def _translate_format(
+    fmt: str, insertions: Sequence[int], children: Iterable[expr.Expr], dtype: DataType
+) -> expr.Expr:
+    encoded = fmt.encode()
+    first, *pieces = (
+        encoded[start:stop].decode()
+        for start, stop in itertools.pairwise((0, *insertions, len(encoded)))
+    )
+    segments = [first]
+    columns: list[expr.Expr] = []
+    for child, piece in zip(children, pieces, strict=True):
+        string_child = _format_input_as_string(child, dtype)
+        if isinstance(string_child, expr.Literal) and string_child.value is not None:
+            segments[-1] += string_child.value + piece
+        else:
+            columns.append(string_child)
+            segments.append(piece)
+    if not columns:
+        return expr.Literal(dtype, segments[0])
+    return expr.StringFunction(
+        dtype, expr.StringFunction.Name.Format, tuple(segments), *columns
+    )
+
+
 def _contains_nested_lists(val: Any) -> bool:
     if not val:
         return False
@@ -1339,6 +1376,14 @@ def _translate_function(
                 options,
                 column,
                 chars,
+            )
+        if name == plrs._expr_nodes.StringFunction.Format:
+            fmt, insertions = options
+            return _translate_format(
+                fmt,
+                insertions,
+                (translator.translate_expr(n=n, schema=schema) for n in node.input),
+                dtype,
             )
         return expr.StringFunction(
             dtype,

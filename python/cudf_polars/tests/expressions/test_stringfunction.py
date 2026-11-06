@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import datetime
+import decimal
 import string
 from functools import partial
 
@@ -883,6 +885,144 @@ def test_concat_horizontal(engine: pl.GPUEngine, ldf, ignore_nulls, separator):
         pl.concat_str(["a", "c"], separator=separator, ignore_nulls=ignore_nulls)
     )
     assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "fmt", ["{}-{}:{}", "{}{}{}", "pre {} mid {} post {}", "é{}→{}{}é"]
+)
+def test_format(engine: pl.GPUEngine, ldf: pl.LazyFrame, fmt: str) -> None:
+    q = ldf.select(pl.format(fmt, "a", "b", "c"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("column", ["a", "b"])
+def test_format_single_input(
+    engine: pl.GPUEngine, ldf: pl.LazyFrame, column: str
+) -> None:
+    q = ldf.select(pl.format("{}", column))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64],
+)
+def test_format_integer(
+    engine: pl.GPUEngine, dtype: type[pl.datatypes.IntegerType]
+) -> None:
+    lo, hi = pl.select(lo=dtype.min(), hi=dtype.max()).row(0)
+    ldf = pl.LazyFrame({"a": pl.Series([lo, hi, 0, None], dtype=dtype)})
+    q = ldf.select(pl.format("<{}>", "a"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_format_boolean(engine: pl.GPUEngine) -> None:
+    ldf = pl.LazyFrame({"a": [True, False, None]})
+    q = ldf.select(pl.format("<{}>", "a"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "value, dtype",
+    [
+        (1, None),
+        (1e20, None),
+        (float("inf"), None),
+        (1 / 3, None),
+        (0.1, pl.Float32),
+        (True, None),
+        (decimal.Decimal("1.50"), None),
+        (datetime.date(2024, 1, 2), None),
+        (datetime.datetime(2024, 1, 2, 3, 4, 5, 678901), None),
+        (datetime.datetime(2024, 1, 2, 3, 4, 5, tzinfo=datetime.UTC), None),
+        (None, None),
+        (None, pl.Int32),
+    ],
+)
+def test_format_literal_input(
+    engine: pl.GPUEngine,
+    ldf: pl.LazyFrame,
+    value: object,
+    dtype: pl.DataType | None,
+) -> None:
+    q = ldf.select(pl.format("{} [{}]", "a", pl.lit(value, dtype=dtype)))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("second", ["non_null", "null"])
+@pytest.mark.parametrize("context", ["select", "with_columns"])
+def test_format_all_literals(engine: pl.GPUEngine, second: str, context: str) -> None:
+    ldf = pl.LazyFrame({"a": [1, 2, 3]})
+    value = pl.lit("x") if second == "non_null" else pl.lit(None)
+    q = getattr(ldf, context)(pl.format("{}-{}", pl.lit(1), value).alias("b"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_format_aggregation_input(engine: pl.GPUEngine, ldf: pl.LazyFrame) -> None:
+    q = ldf.select(pl.format("{}/{}", pl.col("b").sum(), "a"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_format_empty(engine: pl.GPUEngine) -> None:
+    ldf = pl.LazyFrame({"a": pl.Series([], dtype=pl.Int64)})
+    q = ldf.select(pl.format("{}-{}", "a", pl.lit("x")))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_format_polars_cases(engine: pl.GPUEngine) -> None:
+    ldf = pl.LazyFrame({"a": [1, 2, 3], "b": ["a", "b", None]})
+    q = ldf.select(
+        y=pl.format("{} abc", pl.lit("xyz")),
+        z=pl.format("{} abc", pl.col.a),
+        w=pl.format("{} abc {}", pl.col.a, pl.lit("xyz")),
+        a=pl.format("{} abc {}", pl.lit("xyz"), pl.col.a),
+        b=pl.format("abc {} {}", pl.lit("xyz"), pl.col.a),
+        c=pl.format("abc {} {}", pl.lit("xyz"), pl.col.b),
+        d=pl.format("abc {} {}", pl.col.a, pl.col.b),
+        e=pl.format("{} abc {}", pl.col.a, pl.col.b),
+        f=pl.format("{} {} abc", pl.col.a, pl.col.b),
+        g=pl.format("{}{}", pl.col.a, pl.col.b),
+        h=pl.format("{}", pl.col.a),
+        i=pl.format("{}", pl.col.b),
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "fmt, args",
+    [
+        ("{0} {0} {0}", (1, 2)),
+        ("{0}", (1, 2)),
+        ("{y} {1}", (1, 2)),
+        ("{1} {y}", (1, 2)),
+        ("{x} {}", ("test",)),
+        ("{y} {y}", ()),
+    ],
+)
+def test_format_positional_and_named(
+    engine: pl.GPUEngine, fmt: str, args: tuple[object, ...]
+) -> None:
+    ldf = pl.LazyFrame({"x": [1, 2], "y": [3, 4]})
+    q = ldf.select(pl.format(fmt, *(pl.lit(arg) for arg in args)))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_format_group_by(engine: pl.GPUEngine) -> None:
+    ldf = pl.LazyFrame({"x": [0, 0, 1], "y": [0, 5, 2]})
+    q = ldf.group_by("x", maintain_order=True).agg(pl.format("'{}'", pl.col("y")))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [pl.Float32, pl.Float64, pl.Date, pl.Decimal(5, 2)],
+)
+def test_format_unsupported_dtype(
+    in_memory_engine: pl.GPUEngine, dtype: pl.DataType
+) -> None:
+    ldf = pl.LazyFrame({"a": pl.Series([1, None], dtype=dtype)})
+    q = ldf.select(pl.format("<{}>", "a"))
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
 @pytest.mark.parametrize("ascii_case_insensitive", [True, False])

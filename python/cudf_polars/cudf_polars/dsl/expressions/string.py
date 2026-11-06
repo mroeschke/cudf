@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 import re
 from datetime import datetime
 from enum import IntEnum, auto
@@ -127,6 +128,7 @@ class StringFunction(Expr):
         Name.Extract,
         Name.ExtractGroups,
         Name.Find,
+        Name.Format,
         Name.Head,
         Name.JsonDecode,
         Name.JsonPathMatch,
@@ -403,6 +405,37 @@ class StringFunction(Expr):
                     plc.Scalar.from_py(
                         delimiter, self.dtype.plc_type, stream=df.stream
                     ),
+                    plc.Scalar.from_py(None, self.dtype.plc_type, stream=df.stream),
+                    stream=df.stream,
+                ),
+                dtype=self.dtype,
+            )
+        elif self.name is StringFunction.Name.Format:
+            columns = [child.evaluate(df, context=context) for child in self.children]
+            target_length = max((c.size for c in columns if c.size != 1), default=1)
+            parts: list[plc.Column] = []
+            for segment, column in itertools.zip_longest(
+                self.options,
+                broadcast(*columns, target_length=target_length, stream=df.stream),
+            ):
+                if segment:
+                    parts.append(
+                        plc.Column.from_scalar(
+                            plc.Scalar.from_py(
+                                segment, self.dtype.plc_type, stream=df.stream
+                            ),
+                            target_length,
+                            stream=df.stream,
+                        )
+                    )
+                if column is not None:
+                    parts.append(column.obj)
+            if len(parts) == 1:
+                return Column(parts[0], dtype=self.dtype)
+            return Column(
+                plc.strings.combine.concatenate(
+                    plc.Table(parts),
+                    plc.Scalar.from_py("", self.dtype.plc_type, stream=df.stream),
                     plc.Scalar.from_py(None, self.dtype.plc_type, stream=df.stream),
                     stream=df.stream,
                 ),
