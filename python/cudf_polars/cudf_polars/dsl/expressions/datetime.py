@@ -20,6 +20,7 @@ import pylibcudf as plc
 from cudf_polars.containers import Column, DataType
 from cudf_polars.dsl.expressions.base import ExecutionContext, Expr
 from cudf_polars.dsl.utils.reshape import broadcast
+from cudf_polars.utils.dtypes import make_all_null_column
 
 if TYPE_CHECKING:
     from typing import Self
@@ -509,6 +510,10 @@ _MAX_TRUNCATE_MONTHS = 2**40
 # The Gregorian calendar repeats every 400 years.
 _DAYS_PER_400_YEARS = 146_097
 _MONTHS_PER_400_YEARS = 4_800
+# Years that chrono, which polars uses for calendar arithmetic, supports.
+_CHRONO_YEARS = range(-262_143, 262_143)
+# Polars raises for every value offset by more months than chrono spans.
+_MAX_OFFSET_MONTHS = 12 * len(_CHRONO_YEARS)
 # Durations, in nanoseconds, that libcudf's floor/ceil/round_datetimes support
 # directly, and whether libcudf counts them in 32 bits.
 _ROUNDING_FREQUENCIES = (
@@ -797,6 +802,49 @@ def _floor(ticks: plc.Column, every: int, stream: Stream) -> plc.Column:
     return _wrapping(plc.binaryop.BinaryOperator.SUB, ticks, remainder, stream)
 
 
+def _split_400_year_cycles(
+    ticks: plc.Column, day: int, stream: Stream
+) -> tuple[plc.Column | None, plc.Column]:
+    """
+    Split INT64 ``ticks`` into whole 400-year cycles since the epoch and the rest.
+
+    Parameters
+    ----------
+    ticks
+        INT64 ticks, valid on ``stream``.
+    day
+        Ticks per day.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+
+    Returns
+    -------
+    The INT64 number of cycles and the ticks within the cycle, which fall in
+    the years 1970 to 2369. If a cycle does not fit in INT64 (nanoseconds,
+    which only cover the years 1677 to 2262), the cycles are ``None`` and the
+    ticks are returned unchanged.
+    """
+    cycle = _DAYS_PER_400_YEARS * day
+    if cycle >= 2**63:
+        return None, ticks
+    a, b = (plc.expressions.ColumnReference(i) for i in range(2))
+    cycles = _evaluate_int64(
+        [ticks],
+        plc.expressions.Operation(_AST.FLOOR_DIV, a, _int64_literal(cycle, stream)),
+        stream,
+    )
+    within_cycle = _evaluate_int64(
+        [ticks, cycles],
+        plc.expressions.Operation(
+            _AST.SUB,
+            a,
+            plc.expressions.Operation(_AST.MUL, b, _int64_literal(cycle, stream)),
+        ),
+        stream,
+    )
+    return cycles, within_cycle
+
+
 def _month_start_days(
     ticks: plc.Column,
     timestamp_type: plc.DataType,
@@ -832,18 +880,11 @@ def _month_start_days(
     def to_int64(column: plc.Column) -> plc.Column:
         return plc.unary.cast(column, _INT64, stream=stream)
 
-    cycle = _DAYS_PER_400_YEARS * day
-    if cycle < 2**63:
-        cycles = evaluate([ticks], op(_AST.FLOOR_DIV, a, lit(cycle)))
-        within_cycle = evaluate(
-            [ticks, cycles], op(_AST.SUB, a, op(_AST.MUL, b, lit(cycle)))
-        )
-    else:
-        # Nanosecond timestamps only cover the years 1677 to 2262.
+    cycles, within_cycle = _split_400_year_cycles(ticks, day, stream)
+    if cycles is None:
         cycles = plc.Column.from_scalar(
             plc.Scalar.from_py(0, _INT64, stream=stream), ticks.size(), stream=stream
         )
-        within_cycle = ticks
     timestamps = plc.unary.bit_cast(within_cycle, timestamp_type, stream=stream)
     year, month = (
         to_int64(
@@ -1010,6 +1051,308 @@ def _scale_ticks(
     )
 
 
+class _OffsetPlan(NamedTuple):
+    """
+    Device computation for a ``dt.offset_by`` with a literal offset.
+
+    Create plans with :func:`_plan_offset_by` and evaluate them with
+    :func:`_offset_by`.
+    """
+
+    months: int
+    """Signed calendar months, added first."""
+    ticks: int
+    """Signed fixed part, in ticks of the column (microseconds for a Date)."""
+
+
+def _plan_offset_by(dtype: DataType, by: str) -> _OffsetPlan:
+    """
+    Translate ``dt.offset_by(by)`` into a device computation.
+
+    Parameters
+    ----------
+    dtype
+        Dtype of the Date or Datetime column being offset.
+    by
+        Polars duration string, optionally with a leading sign.
+
+    Returns
+    -------
+    The device computation.
+
+    Raises
+    ------
+    NotImplementedError
+        For offsets evaluated on the CPU instead. These include every
+        offset that polars rejects, so the error comes from polars itself.
+
+    Notes
+    -----
+    This mirrors polars' ``offset_by`` (``polars-time``):
+
+    - A leading ``-`` negates every component.
+    - Calendar months (``mo``, ``q``, ``y``) are added first, clamping the day
+      to the end of the month; the weeks, days and sub-day components
+      follow, each converted to the column's time unit rounding toward zero.
+    - A Date is offset as a microsecond Datetime and floored back to days.
+    """
+    sign = -1 if by.startswith("-") else 1
+    body = by[1:] if by.startswith(("-", "+")) else by
+    parsed = (0, 0, 0, 0) if body == "" else _parse_duration_string(body)
+    if parsed is None:
+        raise NotImplementedError(f"dt.offset_by with by={by!r}")
+    months, weeks, days, nanoseconds = parsed
+    polars_type = dtype.polars_type
+    if isinstance(polars_type, pl.Datetime):
+        if polars_type.time_zone not in {None, "UTC"} and (
+            months > 0 or weeks > 0 or days > 0
+        ):
+            # polars adds calendar units in local time for time zone aware datetimes.
+            raise NotImplementedError(
+                f"dt.offset_by with by={by!r} on a datetime with time zone "
+                f"{polars_type.time_zone!r}"
+            )
+        tick = _NANOSECONDS_PER_UNIT[polars_type.time_unit]
+    else:
+        tick = _NANOSECONDS_PER_UNIT["us"]
+    day = _NANOSECONDS_PER_DAY // tick
+    if months > _MAX_OFFSET_MONTHS or max(weeks, days, nanoseconds) >= 2**63:
+        raise NotImplementedError(f"dt.offset_by with by={by!r}")
+    ticks = (7 * weeks + days) * day + nanoseconds // tick
+    return _OffsetPlan(sign * months, sign * ticks)
+
+
+def _civil_year_month(days: int) -> tuple[int, int]:
+    """
+    Return the proleptic Gregorian year and month of ``days`` since the epoch.
+
+    See https://howardhinnant.github.io/date_algorithms.html#civil_from_days.
+    """
+    era, day_of_era = divmod(days + 719_468, _DAYS_PER_400_YEARS)
+    year_of_era = (
+        day_of_era
+        - day_of_era // 1_460
+        + day_of_era // 36_524
+        - day_of_era // (_DAYS_PER_400_YEARS - 1)
+    ) // 365
+    day_of_year = day_of_era - (
+        365 * year_of_era + year_of_era // 4 - year_of_era // 100
+    )
+    shifted_month = (5 * day_of_year + 2) // 153
+    month = shifted_month + 3 if shifted_month < 10 else shifted_month - 9
+    return year_of_era + 400 * era + (month <= 2), month
+
+
+def _month_offset_error(ticks: int, months: int, day: int) -> ComputeError | None:
+    """Return the error polars raises when adding ``months`` to ``ticks``, if any."""
+    year, month = _civil_year_month(ticks // day)
+    if year not in _CHRONO_YEARS:
+        return ComputeError("invalid or out-of-range datetime")
+    target_year = (12 * year + month - 1 + months) // 12
+    if target_year not in _CHRONO_YEARS:
+        return ComputeError(
+            f"cannot advance by {months} months: target year {target_year} "
+            "is out of the supported range"
+        )
+    return None
+
+
+def _month_start_days_since_epoch(month_index: int) -> int:
+    """
+    Return the days since the epoch of the first day of a month.
+
+    ``month_index`` is ``12 * year + month - 1``. See
+    https://howardhinnant.github.io/date_algorithms.html#days_from_civil.
+    """
+    year, month = divmod(month_index, 12)
+    year -= month < 2
+    era, year_of_era = divmod(year, 400)
+    day_of_year = (153 * ((month + 10) % 12) + 2) // 5
+    day_of_era = 365 * year_of_era + year_of_era // 4 - year_of_era // 100
+    return _DAYS_PER_400_YEARS * era + day_of_era + day_of_year - 719_468
+
+
+def _check_month_offset_range(
+    ticks: plc.Column, months: int, day: int, stream: Stream
+) -> None:
+    """
+    Raise like polars if adding ``months`` leaves the years chrono supports.
+
+    Parameters
+    ----------
+    ticks
+        INT64 ticks, valid on ``stream``.
+    months
+        Signed calendar months to add.
+    day
+        Ticks per day.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+        Unless every INT64 value passes, it is synchronized with the host.
+    """
+    if ticks.null_count() == ticks.size():
+        return
+    first_month = 12 * _CHRONO_YEARS.start
+    last_month = 12 * _CHRONO_YEARS.stop - 1
+    low = day * _month_start_days_since_epoch(max(first_month, first_month - months))
+    high = (
+        day * _month_start_days_since_epoch(min(last_month, last_month - months) + 1)
+        - 1
+    )
+    if low <= -(2**63) and high >= 2**63 - 1:
+        return
+    if low <= 2**63 - 1 and high >= -(2**63):
+        column = plc.expressions.ColumnReference(0)
+        out_of_range = plc.transform.compute_column(
+            plc.Table([ticks]),
+            plc.expressions.Operation(
+                _AST.LOGICAL_OR,
+                plc.expressions.Operation(
+                    _AST.LESS, column, _int64_literal(max(low, -(2**63)), stream)
+                ),
+                plc.expressions.Operation(
+                    _AST.GREATER, column, _int64_literal(min(high, 2**63 - 1), stream)
+                ),
+            ),
+            stream=stream,
+        )
+        if not plc.reduce.reduce(
+            out_of_range,
+            plc.aggregation.any(),
+            plc.DataType(plc.TypeId.BOOL8),
+            stream=stream,
+        ).to_py(stream=stream):
+            return
+    # Adding months is monotonic, so an extreme value is out of range.
+    raise next(
+        error
+        for scalar in plc.reduce.minmax(ticks, stream=stream)
+        if (
+            error := _month_offset_error(
+                cast("int", scalar.to_py(stream=stream)), months, day
+            )
+        )
+        is not None
+    )
+
+
+def _add_months(
+    ticks: plc.Column,
+    timestamp_type: plc.DataType,
+    months: int,
+    day: int,
+    stream: Stream,
+) -> plc.Column:
+    """
+    Add calendar ``months`` to INT64 ``ticks`` of ``timestamp_type``.
+
+    libcudf's calendar functions use 16-bit years, so values are first moved
+    by whole 400-year cycles into the years 1970 to 2369, where they are
+    exact, and the months are split into whole cycles and fewer than 4800
+    months. The cycles are added back afterwards in INT64. Nanosecond values,
+    whose cycle does not fit in INT64, are not moved.
+    """
+    _check_month_offset_range(ticks, months, day, stream)
+    a, b = (plc.expressions.ColumnReference(i) for i in range(2))
+    cycle = _DAYS_PER_400_YEARS * day
+    cycles_to_add, months_in_cycle = divmod(months, _MONTHS_PER_400_YEARS)
+    cycles, within_cycle = _split_400_year_cycles(ticks, day, stream)
+    shifted = plc.unary.bit_cast(
+        plc.datetime.add_calendrical_months(
+            plc.unary.bit_cast(within_cycle, timestamp_type, stream=stream),
+            plc.Scalar.from_py(
+                months_in_cycle, plc.DataType(plc.TypeId.INT32), stream=stream
+            ),
+            stream=stream,
+        ),
+        _INT64,
+        stream=stream,
+    )
+    if cycles is None:
+        # polars wraps nanosecond results outside the years 1677 to 2262.
+        return _wrapping(
+            plc.binaryop.BinaryOperator.ADD, shifted, cycles_to_add * cycle, stream
+        )
+    return _evaluate_int64(
+        [shifted, cycles],
+        plc.expressions.Operation(
+            _AST.ADD,
+            a,
+            plc.expressions.Operation(
+                _AST.MUL,
+                plc.expressions.Operation(
+                    _AST.ADD, b, _int64_literal(cycles_to_add, stream)
+                ),
+                _int64_literal(cycle, stream),
+            ),
+        ),
+        stream,
+    )
+
+
+def _offset_by(column: plc.Column, plan: _OffsetPlan, stream: Stream) -> plc.Column:
+    """
+    Evaluate a ``dt.offset_by`` planned by :func:`_plan_offset_by`.
+
+    Parameters
+    ----------
+    column
+        Date or Datetime column to offset, of the type the plan was made for.
+    plan
+        Plan from :func:`_plan_offset_by`.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+
+    Returns
+    -------
+    The offset column.
+
+    Raises
+    ------
+    ComputeError
+        If calendar months are added to a value outside the years chrono
+        supports, or the result leaves them.
+    """
+    months, fixed = plan
+    on_date = column.type().id() == plc.TypeId.TIMESTAMP_DAYS
+    if on_date:
+        timestamp_type = plc.DataType(plc.TypeId.TIMESTAMP_MICROSECONDS)
+        days = plc.unary.cast(
+            plc.unary.bit_cast(column, plc.DataType(plc.TypeId.INT32), stream=stream),
+            _INT64,
+            stream=stream,
+        )
+        # polars casts the Date to a microsecond Datetime, which is null where
+        # it overflows.
+        ticks = _scale_ticks(
+            days, _NANOSECONDS_PER_DAY // 1_000, stream, max_abs_ticks=2**31
+        )
+    else:
+        timestamp_type = column.type()
+        ticks = plc.unary.bit_cast(column, _INT64, stream=stream)
+    day = _NANOSECONDS_PER_DAY // _TIMESTAMP_TICK_NANOSECONDS[timestamp_type.id()]
+    if months != 0:
+        ticks = _add_months(ticks, timestamp_type, months, day, stream)
+    if fixed != 0:
+        ticks = _wrapping(plc.binaryop.BinaryOperator.ADD, ticks, fixed, stream)
+    if not on_date:
+        return plc.unary.bit_cast(ticks, column.type(), stream=stream)
+    days = _evaluate_int64(
+        [ticks],
+        plc.expressions.Operation(
+            _AST.FLOOR_DIV,
+            plc.expressions.ColumnReference(0),
+            _int64_literal(day, stream),
+        ),
+        stream,
+    )
+    return plc.unary.bit_cast(
+        plc.unary.cast(days, plc.DataType(plc.TypeId.INT32), stream=stream),
+        column.type(),
+        stream=stream,
+    )
+
+
 class TemporalFunction(Expr):
     class Name(IntEnum):
         """Internal and picklable representation of polars' `TemporalFunction`."""
@@ -1122,6 +1465,7 @@ class TemporalFunction(Expr):
         Name.Quarter,
         Name.ConvertTimeZone,
         Name.ReplaceTimeZone,
+        Name.OffsetBy,
         *_CENTURY_MILLENNIUM_DIVISOR.keys(),
         *_TOTAL_COMPONENT_NANOSECONDS.keys(),
     }
@@ -1188,6 +1532,24 @@ class TemporalFunction(Expr):
                 raise NotImplementedError(f"dt.combine with {time_dtype} time input")
             if isinstance(date_dtype, pl.Datetime):
                 self.tz_descs = (_get_tz_desc(date_dtype.time_zone), None)
+        elif self.name is TemporalFunction.Name.OffsetBy:
+            from cudf_polars.dsl.expressions.literal import Literal
+
+            column, by = self.children
+            if by.dtype.id() != plc.TypeId.STRING:
+                raise SchemaError(
+                    "invalid series dtype: expected `String`, got "
+                    f"`{by.dtype.polars_type}`"
+                )
+            if not isinstance(column.dtype.polars_type, (pl.Date, pl.Datetime)):
+                raise InvalidOperationError(
+                    f"expected Date or Datetime, got {column.dtype.polars_type}"
+                )
+            if not isinstance(by, Literal):
+                raise NotImplementedError("dt.offset_by with a non-literal by")
+            self.options = (
+                None if by.value is None else _plan_offset_by(column.dtype, by.value),
+            )
         elif self.name in {
             TemporalFunction.Name.Truncate,
             TemporalFunction.Name.Round,
@@ -1435,6 +1797,15 @@ class TemporalFunction(Expr):
                 _truncate(column.obj, cast("_TruncatePlan", self.options), df.stream),
                 dtype=self.dtype,
             )
+        elif self.name is TemporalFunction.Name.OffsetBy:
+            (column, _) = columns
+            (plan,) = self.options
+            if plan is None:
+                return Column(
+                    make_all_null_column(self.dtype, column.size, df.stream),
+                    dtype=self.dtype,
+                )
+            return Column(_offset_by(column.obj, plan, df.stream), dtype=self.dtype)
         elif self.name is TemporalFunction.Name.Date:
             (column,) = columns
             # Casting the timestamp to TIMESTAMP_DAYS (the storage of ``pl.Date``)

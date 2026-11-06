@@ -1291,3 +1291,343 @@ def test_datetime_combine_integer_time_unsupported(in_memory_engine: pl.GPUEngin
     ldf = pl.LazyFrame({"a": [datetime.date(2024, 1, 1)], "b": [1]})
     q = ldf.select(pl.col("a").dt.combine(pl.col("b")))
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [
+        "1d",
+        "-1d",
+        "1mo",
+        "1mo1d",
+        "-1y2mo3d4h",
+        "1q",
+        "2w",
+        "90m",
+        "1ns",
+        "-1500ns",
+        "72h",
+        "+2d24h",
+        "-2mo",
+        "1y1mo",
+        "",
+        "-0d",
+    ],
+)
+def test_datetime_offset_by(
+    engine: pl.GPUEngine, time_unit: Literal["ms", "us", "ns"], offset: str
+):
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [
+                    datetime.datetime(2024, 1, 31, 12, 34, 56, 789123),
+                    datetime.datetime(2024, 2, 29),
+                    None,
+                    datetime.datetime(2020, 1, 1),
+                    datetime.datetime(2022, 3, 30),
+                    datetime.datetime(2018, 1, 31),
+                    datetime.datetime(1969, 12, 31, 23, 59, 59, 999999),
+                ],
+                dtype=pl.Datetime(time_unit),
+            )
+        }
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [
+        "1d",
+        "-1d",
+        "3d",
+        "72h",
+        "+2d24h",
+        "-2mo",
+        "1mo1d",
+        "1y",
+        "1y1mo1d",
+        "-1h",
+        "-1ns",
+    ],
+)
+def test_date_offset_by(engine: pl.GPUEngine, offset: str):
+    ldf = pl.LazyFrame(
+        {
+            "a": [
+                datetime.date(2020, 1, 1),
+                datetime.date(2020, 1, 2),
+                datetime.date(2024, 1, 31),
+                datetime.date(2024, 2, 29),
+                None,
+                datetime.date(2018, 1, 31),
+                datetime.date(1969, 12, 31),
+            ]
+        }
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "time_zone, offset",
+    [
+        ("UTC", "1mo1d"),
+        ("UTC", "-1y"),
+        ("UTC", "2y1mo1q1h1d"),
+        ("Europe/London", "7m"),
+        ("Asia/Kathmandu", "-3m"),
+        ("America/Chicago", "-25h1ns"),
+        ("America/Chicago", "1h"),
+        ("America/Chicago", "-90m"),
+    ],
+)
+def test_datetime_offset_by_time_zone(
+    engine: pl.GPUEngine,
+    time_unit: Literal["ms", "us", "ns"],
+    time_zone: str,
+    offset: str,
+):
+    ranges = [
+        (datetime.datetime(2020, 2, 28), datetime.datetime(2020, 3, 1), "8h"),
+        (datetime.datetime(2021, 3, 14, 6), datetime.datetime(2021, 3, 14, 10), "30m"),
+        (datetime.datetime(2021, 11, 7, 5), datetime.datetime(2021, 11, 7, 9), "30m"),
+    ]
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.concat(
+                pl.datetime_range(
+                    start, end, every, time_unit=time_unit, time_zone="UTC", eager=True
+                )
+                for start, end, every in ranges
+            ).dt.convert_time_zone(time_zone)
+        }
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "make_expr",
+    [
+        pytest.param(
+            lambda: pl.lit(datetime.datetime(2021, 11, 26)).dt.offset_by("1mo1d"),
+            id="literal_datetime",
+        ),
+        pytest.param(
+            lambda: pl.lit(datetime.date(2020, 10, 25)).dt.offset_by("1y1mo1d"),
+            id="literal_date",
+        ),
+        pytest.param(
+            lambda: pl.col("a").dt.offset_by(pl.lit(None, dtype=pl.String())),
+            id="null_offset",
+        ),
+        pytest.param(
+            lambda: pl.col("a").dt.date().dt.offset_by(pl.lit(None, dtype=pl.String())),
+            id="null_offset_date",
+        ),
+    ],
+)
+def test_datetime_offset_by_literal(engine: pl.GPUEngine, make_expr):
+    ldf = pl.LazyFrame({"a": [datetime.datetime(2020, 10, 25), None]})
+    q = ldf.select(make_expr())
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("offset", ["1mo", "-1y", "1s"])
+def test_datetime_offset_by_empty(
+    engine: pl.GPUEngine, time_unit: Literal["ms", "us", "ns"], offset: str
+):
+    ldf = pl.LazyFrame({"a": pl.Series([], dtype=pl.Datetime(time_unit))})
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("dtype", [pl.Date(), pl.Datetime("ms"), pl.Datetime("ns")])
+@pytest.mark.parametrize("offset", ["1mo", "-1d"])
+def test_datetime_offset_by_sliced(
+    engine: pl.GPUEngine, dtype: pl.DataType, offset: str
+):
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [
+                    datetime.datetime(2024, 1, 31),
+                    None,
+                    datetime.datetime(2024, 2, 29, 12),
+                    datetime.datetime(1969, 12, 31),
+                    datetime.datetime(2020, 1, 1),
+                ]
+            ).cast(dtype)
+        }
+    )
+    q = ldf.slice(1, 3).select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "offset", ["1s", "-1s", "1w1ns", "-1d", "-123456d", "1d123456w4800s"]
+)
+def test_datetime_offset_by_wraps(
+    engine: pl.GPUEngine, time_unit: Literal["ms", "us", "ns"], offset: str
+):
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [-(2**63) + 1, -(2**63) + 10, 0, 2**63 - 10, 2**63 - 1], dtype=pl.Int64
+            ).cast(pl.Datetime(time_unit))
+        }
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("offset", ["1mo", "-1mo", "4800mo", "-4801mo", "100000y1s"])
+def test_datetime_offset_by_nanoseconds_wraps(engine: pl.GPUEngine, offset: str):
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [-(2**63) + 1, -1, 0, 2**63 - 10, 2**63 - 1], dtype=pl.Int64
+            ).cast(pl.Datetime("ns"))
+        }
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("time_unit", ["ms", "us"])
+@pytest.mark.parametrize("offset", ["1mo", "-1y2mo3d4h", "4800mo", "-50000y"])
+def test_datetime_offset_by_far_from_epoch(
+    engine: pl.GPUEngine, time_unit: Literal["ms", "us"], offset: str
+):
+    ticks_per_year = _TICKS_PER_DAY[time_unit] * 365
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [-200_000 * ticks_per_year, 40_000 * ticks_per_year, None, 0],
+                dtype=pl.Int64,
+            ).cast(pl.Datetime(time_unit))
+        }
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("offset", ["1d", "-1h", "0d", "1w1us"])
+def test_date_offset_by_out_of_range(engine: pl.GPUEngine, offset: str):
+    max_days = 2**63 // _TICKS_PER_DAY["us"]
+    days = [-(2**31), -max_days - 1, -max_days, max_days, max_days + 1, 2**31 - 1]
+    ldf = pl.LazyFrame(
+        {"a": pl.Series(days, dtype=pl.Int64).cast(pl.Int32).cast(pl.Date())}
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_date_offset_by_chrono_boundary(engine: pl.GPUEngine):
+    ldf = pl.LazyFrame({"a": [datetime.date(2023, 1, 1)]})
+    q = ldf.select(pl.col("a").dt.offset_by("260119y"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "valid_days, days, offset",
+    [
+        (0, 19_358, "260120y"),
+        (50_000_000, 19_358, "-300000y"),
+        (0, 95_700_000, "1mo"),
+        (0, -96_500_000, "-1mo"),
+    ],
+    ids=["after_max_year", "before_min_year", "input_after_max", "input_before_min"],
+)
+def test_date_offset_by_chrono_out_of_range_raises(
+    engine: pl.GPUEngine, valid_days: int, days: int, offset: str
+):
+    ldf = pl.LazyFrame(
+        {"a": pl.Series([valid_days, days, None], dtype=pl.Int32).cast(pl.Date())}
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    if is_streaming_engine(engine):
+        with pytest.RaisesGroup(pl.exceptions.ComputeError):
+            q.collect(engine=engine)
+    else:
+        with pytest.raises(pl.exceptions.ComputeError):
+            q.collect(engine=engine)
+
+
+@pytest.mark.parametrize("offset", ["260465y", "260466y", "-264406y"])
+def test_datetime_offset_by_nanoseconds_out_of_range_raises(
+    engine: pl.GPUEngine, offset: str
+):
+    ldf = pl.LazyFrame({"a": pl.Series([0, None]).cast(pl.Datetime("ns"))})
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    if is_streaming_engine(engine):
+        with pytest.RaisesGroup(pl.exceptions.ComputeError):
+            q.collect(engine=engine)
+    else:
+        with pytest.raises(pl.exceptions.ComputeError):
+            q.collect(engine=engine)
+
+
+@pytest.mark.parametrize(
+    "offset",
+    ["1i", "?", "--1d", "+1d+1m", "1", "1mo23d4", "1D", "12時30分45秒", "2147483647mo"],
+)
+def test_datetime_offset_by_unsupported_offset(
+    in_memory_engine: pl.GPUEngine, offset: str
+):
+    ldf = pl.LazyFrame({"a": [datetime.datetime(2022, 3, 20, 5, 7)]})
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+@pytest.mark.parametrize("offset", ["1d", "1w", "1mo", "-1y1h"])
+def test_datetime_offset_by_time_zone_calendar_unsupported(
+    in_memory_engine: pl.GPUEngine, offset: str
+):
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series([datetime.datetime(2021, 11, 7)]).dt.replace_time_zone(
+                "America/Chicago"
+            )
+        }
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(offset))
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+def test_datetime_offset_by_column_unsupported(in_memory_engine: pl.GPUEngine):
+    ldf = pl.LazyFrame(
+        {"a": [datetime.datetime(2020, 10, 25), None], "b": ["1d", "10d"]}
+    )
+    q = ldf.select(pl.col("a").dt.offset_by(pl.col("b")))
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+@pytest.mark.parametrize(
+    "make_query, exception",
+    [
+        pytest.param(
+            lambda ldf: ldf.select(pl.col("a").dt.offset_by(pl.lit(None))),
+            pl.exceptions.SchemaError,
+            id="null_dtype_offset",
+        ),
+        pytest.param(
+            lambda ldf: ldf.select(pl.col("b").dt.offset_by("1d")),
+            pl.exceptions.InvalidOperationError,
+            id="integer_input",
+        ),
+        pytest.param(
+            lambda ldf: ldf.select(pl.col("b").dt.offset_by(pl.col("b"))),
+            pl.exceptions.SchemaError,
+            id="integer_input_integer_by",
+        ),
+    ],
+)
+def test_datetime_offset_by_invalid(
+    in_memory_engine: pl.GPUEngine, make_query, exception
+):
+    ldf = pl.LazyFrame({"a": [datetime.datetime(2020, 10, 25)], "b": [1]})
+    assert_ir_translation_raises(make_query(ldf), in_memory_engine, exception)
