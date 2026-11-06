@@ -1296,23 +1296,27 @@ def _(
     dtype: DataType,
     schema: Schema,
 ) -> expr.Expr:
-    name = node.function_data[0]
+    function_data = node.function_data
+    function_data = (
+        function_data if isinstance(function_data, tuple) else (function_data,)
+    )
     previous = translator._list_literals_as_elements
-    translator._list_literals_as_elements = name in _LIST_LITERAL_CONSUMERS
+    translator._list_literals_as_elements = function_data[0] in _LIST_LITERAL_CONSUMERS
     try:
-        return _translate_function(node, translator, dtype, schema)
+        return _translate_function(node, function_data, translator, dtype, schema)
     finally:
         translator._list_literals_as_elements = previous
 
 
 def _translate_function(
     node: plrs._expr_nodes.Function,
+    function_data: tuple[Any, ...],
     translator: Translator,
     dtype: DataType,
     schema: Schema,
 ) -> expr.Expr:
-    name, *options = node.function_data
-    options = tuple(options)
+    name = function_data[0]
+    options: tuple[Any, ...] = function_data[1:]
     if isinstance(name, plrs._expr_nodes.StringFunction):
         if name in {
             plrs._expr_nodes.StringFunction.StripChars,
