@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import calendar
 import re
 import zoneinfo
 from enum import IntEnum, auto
@@ -1012,8 +1013,9 @@ def _scale_ticks(
 
 class _ReplacePlan(NamedTuple):
     """
-    Literal components of a ``dt.replace``; ``None`` keeps the input's value.
+    A ``dt.replace`` with literal components.
 
+    Each component is its replacement, or ``None`` to keep the input's.
     Create plans with :func:`_plan_replace` and evaluate them with
     :func:`_replace`.
     """
@@ -1025,13 +1027,45 @@ class _ReplacePlan(NamedTuple):
     minute: int | None
     second: int | None
     microsecond: int | None
+    check_date: bool
+    """Whether replacing the components can give an invalid date."""
 
 
 _CHRONO_YEARS = (-262_143, 262_142)
+_CHRONO_DAYS = (-96_465_292, 95_026_236)
 _NANOSECOND_TIMESTAMP_YEARS = (1678, 2261)
 _INT8_RANGE = (-(2**7), 2**7 - 1)
 _REPLACE_TIME_RANGES = ((0, 23), (0, 59), (0, 59), (0, 999_999))
 _DAYS_FROM_0000_03_01_TO_EPOCH = 719_468
+_DAYS_IN_MONTH = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def _op(
+    operator: plc.expressions.ASTOperator, *operands: plc.expressions.Expression
+) -> plc.expressions.Operation:
+    return plc.expressions.Operation(operator, *operands)
+
+
+def _days_in_month(year: int, month: int) -> int:
+    return _DAYS_IN_MONTH[month - 1] + (month == 2 and calendar.isleap(year))
+
+
+def _is_valid_date(year: int, month: int, day: int) -> bool:
+    return 1 <= month <= 12 and 1 <= day <= _days_in_month(year, month)
+
+
+def _can_get_invalid_date(year: int | None, month: int | None, day: int | None) -> bool:
+    """Whether replacing these components of a valid date can make it invalid."""
+    return not all(
+        _is_valid_date(
+            old_year if year is None else year,
+            old_month if month is None else month,
+            old_day if day is None else day,
+        )
+        for old_year in (2000, 2001)
+        for old_month in range(1, 13)
+        for old_day in range(1, _days_in_month(old_year, old_month) + 1)
+    )
 
 
 def _replace_component(expr: Expr, bounds: tuple[int, int]) -> int | None:
@@ -1064,14 +1098,15 @@ def _plan_replace(dtype: DataType, components: tuple[Expr, ...]) -> _ReplacePlan
 
     Returns
     -------
-    The literal components.
+    The plan.
 
     Raises
     ------
     NotImplementedError
         For a time zone aware input, for components that are not integer
-        literals, and for literals for which polars raises regardless of the
-        data or that do not fit the input's time unit.
+        literals, for an ``ambiguous`` that is computed, and for literals for
+        which polars raises regardless of the data or that do not fit the
+        input's time unit.
     InvalidOperationError
         For an input that is not a Date or Datetime.
 
@@ -1080,6 +1115,7 @@ def _plan_replace(dtype: DataType, components: tuple[Expr, ...]) -> _ReplacePlan
     polars ignores the time components and ``ambiguous`` of a Date, and
     ``ambiguous`` of a naive Datetime.
     """
+    from cudf_polars.dsl.expressions.base import Col
     from cudf_polars.dsl.expressions.literal import Literal
 
     year, month, day, *time, ambiguous = components
@@ -1094,8 +1130,9 @@ def _plan_replace(dtype: DataType, components: tuple[Expr, ...]) -> _ReplacePlan
         _replace_component(month, _INT8_RANGE),
         _replace_component(day, _INT8_RANGE),
     )
+    check_date = _can_get_invalid_date(*date_parts)
     if isinstance(polars_type, pl.Date):
-        return _ReplacePlan(*date_parts, None, None, None, None)
+        return _ReplacePlan(*date_parts, None, None, None, None, check_date)
     if not isinstance(polars_type, pl.Datetime):
         raise InvalidOperationError(
             f"`round` operation not supported for dtype `{polars_type._string_repr()}` "
@@ -1103,84 +1140,109 @@ def _plan_replace(dtype: DataType, components: tuple[Expr, ...]) -> _ReplacePlan
         )
     if polars_type.time_zone is not None:
         raise NotImplementedError("dt.replace on a time zone aware datetime")
-    if not isinstance(ambiguous, Literal):
-        raise NotImplementedError("dt.replace with a non-literal ambiguous")
-    return _ReplacePlan(
-        *date_parts,
-        *(
-            _replace_component(expr, bounds)
-            for expr, bounds in zip(time, _REPLACE_TIME_RANGES, strict=True)
+    if not isinstance(ambiguous, Literal) and not (
+        isinstance(ambiguous, Col) and ambiguous.dtype.id() == plc.TypeId.STRING
+    ):
+        raise NotImplementedError("dt.replace with a computed ambiguous")
+    hour, minute, second, microsecond = (
+        _replace_component(expr, bounds)
+        for expr, bounds in zip(time, _REPLACE_TIME_RANGES, strict=True)
+    )
+    return _ReplacePlan(*date_parts, hour, minute, second, microsecond, check_date)
+
+
+def _civil_operands(
+    ticks: plc.Column, ticks_per_day: int, plan: _ReplacePlan, stream: Stream
+) -> tuple[
+    tuple[
+        plc.expressions.Expression,
+        plc.expressions.Expression,
+        plc.expressions.Expression,
+    ],
+    tuple[plc.Column, ...],
+]:
+    """
+    AST operands of the year, month and day of ``ticks`` after the plan.
+
+    Parameters
+    ----------
+    ticks
+        INT64 ticks since the epoch, referenced as column 0.
+    ticks_per_day
+        Ticks in one day.
+    plan
+        Plan from :func:`_plan_replace`.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+
+    Returns
+    -------
+    The operands: a literal for each replaced component, and a reference for
+    each kept one. Also the INT64 columns referenced, from column 1 on.
+
+    Notes
+    -----
+    libcudf evaluates a repeated AST subexpression once per use, so the kept
+    components are columns from libcudf's calendar functions instead of ASTs.
+    Those use 16-bit years, so the days are first moved by whole 400-year
+    cycles into the years 1970 to 2369, where they are exact.
+    """
+    days = _op(
+        _AST.FLOOR_DIV,
+        plc.expressions.ColumnReference(0),
+        _int64_literal(ticks_per_day, stream),
+    )
+    cycle = _int64_literal(_DAYS_PER_400_YEARS, stream)
+    within_cycle: plc.Column | None = None
+    operands: list[plc.expressions.Expression] = []
+    columns: list[plc.Column] = []
+    for value, component in zip(
+        plan[:3],
+        (
+            plc.datetime.DatetimeComponent.YEAR,
+            plc.datetime.DatetimeComponent.MONTH,
+            plc.datetime.DatetimeComponent.DAY,
         ),
-    )
-
-
-def _is_valid_date(year: int, month: int, day: int) -> bool:
-    if not 1 <= month <= 12:
-        return False
-    is_leap = (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
-    days_in_month = (31, 28 + is_leap, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
-    return 1 <= day <= days_in_month[month - 1]
-
-
-def _is_valid_date_ast(
-    year: plc.expressions.Expression,
-    month: plc.expressions.Expression,
-    day: plc.expressions.Expression,
-    stream: Stream,
-) -> plc.expressions.Expression:
-    """AST of whether INT64 ``(year, month, day)`` is a valid calendar date."""
-
-    def lit(value: int) -> plc.expressions.Literal:
-        return _int64_literal(value, stream)
-
-    def op(
-        operator: plc.expressions.ASTOperator, *operands: plc.expressions.Expression
-    ) -> plc.expressions.Operation:
-        return plc.expressions.Operation(operator, *operands)
-
-    def all_of(*operands: plc.expressions.Expression) -> plc.expressions.Expression:
-        result, *rest = operands
-        for operand in rest:
-            result = op(_AST.LOGICAL_AND, result, operand)
-        return result
-
-    is_leap = op(
-        _AST.LOGICAL_OR,
-        op(
-            _AST.LOGICAL_AND,
-            op(_AST.EQUAL, op(_AST.MOD, year, lit(4)), lit(0)),
-            op(_AST.NOT_EQUAL, op(_AST.MOD, year, lit(100)), lit(0)),
-        ),
-        op(_AST.EQUAL, op(_AST.MOD, year, lit(400)), lit(0)),
-    )
-    has_31_days = op(
-        _AST.EQUAL,
-        op(_AST.MOD, op(_AST.ADD, month, op(_AST.DIV, month, lit(8))), lit(2)),
-        lit(1),
-    )
-    is_february = op(_AST.EQUAL, month, lit(2))
-    fits_month = op(
-        _AST.LOGICAL_OR,
-        op(_AST.LESS_EQUAL, day, lit(28)),
-        op(
-            _AST.LOGICAL_OR,
-            all_of(
-                op(_AST.NOT, is_february),
-                op(
-                    _AST.LOGICAL_OR,
-                    op(_AST.LESS_EQUAL, day, lit(30)),
-                    op(_AST.LOGICAL_AND, op(_AST.EQUAL, day, lit(31)), has_31_days),
+        strict=True,
+    ):
+        if value is not None:
+            operands.append(_int64_literal(value, stream))
+            continue
+        if within_cycle is None:
+            within_cycle = plc.unary.bit_cast(
+                plc.unary.cast(
+                    _evaluate_int64([ticks], _op(_AST.PYMOD, days, cycle), stream),
+                    plc.DataType(plc.TypeId.INT32),
+                    stream=stream,
                 ),
+                plc.DataType(plc.TypeId.TIMESTAMP_DAYS),
+                stream=stream,
+            )
+        extracted = plc.unary.cast(
+            plc.datetime.extract_datetime_component(
+                within_cycle, component, stream=stream
             ),
-            all_of(is_february, op(_AST.EQUAL, day, lit(29)), is_leap),
-        ),
-    )
-    return all_of(
-        op(_AST.GREATER_EQUAL, month, lit(1)),
-        op(_AST.LESS_EQUAL, month, lit(12)),
-        op(_AST.GREATER_EQUAL, day, lit(1)),
-        fits_month,
-    )
+            _INT64,
+            stream=stream,
+        )
+        if component is plc.datetime.DatetimeComponent.YEAR:
+            extracted = _evaluate_int64(
+                [ticks, extracted],
+                _op(
+                    _AST.ADD,
+                    plc.expressions.ColumnReference(1),
+                    _op(
+                        _AST.MUL,
+                        _op(_AST.FLOOR_DIV, days, cycle),
+                        _int64_literal(400, stream),
+                    ),
+                ),
+                stream,
+            )
+        columns.append(extracted)
+        operands.append(plc.expressions.ColumnReference(len(columns)))
+    year, month, day = operands
+    return (year, month, day), tuple(columns)
 
 
 def _days_from_civil_ast(
@@ -1194,270 +1256,290 @@ def _days_from_civil_ast(
 
     See https://howardhinnant.github.io/date_algorithms.html#days_from_civil.
     """
-
-    def lit(value: int) -> plc.expressions.Literal:
-        return _int64_literal(value, stream)
-
-    def op(
-        operator: plc.expressions.ASTOperator, *operands: plc.expressions.Expression
-    ) -> plc.expressions.Operation:
-        return plc.expressions.Operation(operator, *operands)
-
-    is_jan_or_feb = op(_AST.DIV, op(_AST.SUB, lit(14), month), lit(12))
-    march_based_year = op(_AST.SUB, year, is_jan_or_feb)
-    era = op(_AST.FLOOR_DIV, march_based_year, lit(400))
-    year_of_era = op(_AST.PYMOD, march_based_year, lit(400))
-    march_based_month = op(
-        _AST.SUB, op(_AST.ADD, month, op(_AST.MUL, is_jan_or_feb, lit(12))), lit(3)
+    is_jan_or_feb = _op(
+        _AST.DIV,
+        _op(_AST.SUB, _int64_literal(14, stream), month),
+        _int64_literal(12, stream),
     )
-    day_of_year = op(
+    march_based_year = _op(_AST.SUB, year, is_jan_or_feb)
+    era = _op(_AST.FLOOR_DIV, march_based_year, _int64_literal(400, stream))
+    year_of_era = _op(_AST.PYMOD, march_based_year, _int64_literal(400, stream))
+    march_based_month = _op(
+        _AST.SUB,
+        _op(_AST.ADD, month, _op(_AST.MUL, is_jan_or_feb, _int64_literal(12, stream))),
+        _int64_literal(3, stream),
+    )
+    day_of_year = _op(
         _AST.ADD,
-        op(
+        _op(
             _AST.DIV,
-            op(_AST.ADD, op(_AST.MUL, march_based_month, lit(153)), lit(2)),
-            lit(5),
-        ),
-        op(_AST.SUB, day, lit(1)),
-    )
-    day_of_era = op(
-        _AST.ADD,
-        op(
-            _AST.SUB,
-            op(
+            _op(
                 _AST.ADD,
-                op(_AST.MUL, year_of_era, lit(365)),
-                op(_AST.DIV, year_of_era, lit(4)),
+                _op(_AST.MUL, march_based_month, _int64_literal(153, stream)),
+                _int64_literal(2, stream),
             ),
-            op(_AST.DIV, year_of_era, lit(100)),
+            _int64_literal(5, stream),
+        ),
+        _op(_AST.SUB, day, _int64_literal(1, stream)),
+    )
+    day_of_era = _op(
+        _AST.ADD,
+        _op(
+            _AST.SUB,
+            _op(
+                _AST.ADD,
+                _op(_AST.MUL, year_of_era, _int64_literal(365, stream)),
+                _op(_AST.DIV, year_of_era, _int64_literal(4, stream)),
+            ),
+            _op(_AST.DIV, year_of_era, _int64_literal(100, stream)),
         ),
         day_of_year,
     )
-    return op(
+    return _op(
         _AST.SUB,
-        op(_AST.ADD, op(_AST.MUL, era, lit(_DAYS_PER_400_YEARS)), day_of_era),
-        lit(_DAYS_FROM_0000_03_01_TO_EPOCH),
+        _op(
+            _AST.ADD,
+            _op(_AST.MUL, era, _int64_literal(_DAYS_PER_400_YEARS, stream)),
+            day_of_era,
+        ),
+        _int64_literal(_DAYS_FROM_0000_03_01_TO_EPOCH, stream),
     )
 
 
-def _civil_components(
-    ticks: plc.Column, ticks_per_day: int, plan: _ReplacePlan, stream: Stream
-) -> tuple[int | plc.Column, int | plc.Column, int | plc.Column]:
-    """
-    The year, month and day of ``ticks`` after replacing the plan's.
+def _is_valid_date_ast(
+    year: plc.expressions.Expression,
+    month: plc.expressions.Expression,
+    day: plc.expressions.Expression,
+    stream: Stream,
+) -> plc.expressions.Expression:
+    """AST of whether INT64 ``(year, month, day)`` is a valid calendar date."""
 
-    Parameters
-    ----------
-    ticks
-        INT64 ticks since the epoch.
-    ticks_per_day
-        Ticks in one day.
-    plan
-        Plan from :func:`_plan_replace`.
-    stream
-        CUDA stream used for device memory operations and kernel launches.
+    def all_of(*operands: plc.expressions.Expression) -> plc.expressions.Expression:
+        result, *rest = operands
+        for operand in rest:
+            result = _op(_AST.LOGICAL_AND, result, operand)
+        return result
 
-    Returns
-    -------
-    Each replaced component as an ``int``, and each other component as an
-    INT64 column, null where ``ticks`` is.
-
-    Notes
-    -----
-    libcudf's calendar functions use 16-bit years, so the days are first moved
-    by whole 400-year cycles into the years 1970 to 2369, where they are exact.
-    """
-    replaced = (plan.year, plan.month, plan.day)
-    if None not in replaced:
-        return cast("tuple[int, int, int]", replaced)
-    days = plc.expressions.Operation(
-        _AST.FLOOR_DIV,
-        plc.expressions.ColumnReference(0),
-        _int64_literal(ticks_per_day, stream),
-    )
-    cycle = _int64_literal(_DAYS_PER_400_YEARS, stream)
-    within_cycle = plc.unary.bit_cast(
-        plc.unary.cast(
-            _evaluate_int64(
-                [ticks], plc.expressions.Operation(_AST.PYMOD, days, cycle), stream
+    is_leap = _op(
+        _AST.LOGICAL_OR,
+        _op(
+            _AST.LOGICAL_AND,
+            _op(
+                _AST.EQUAL,
+                _op(_AST.MOD, year, _int64_literal(4, stream)),
+                _int64_literal(0, stream),
             ),
-            plc.DataType(plc.TypeId.INT32),
-            stream=stream,
+            _op(
+                _AST.NOT_EQUAL,
+                _op(_AST.MOD, year, _int64_literal(100, stream)),
+                _int64_literal(0, stream),
+            ),
         ),
-        plc.DataType(plc.TypeId.TIMESTAMP_DAYS),
-        stream=stream,
+        _op(
+            _AST.EQUAL,
+            _op(_AST.MOD, year, _int64_literal(400, stream)),
+            _int64_literal(0, stream),
+        ),
     )
-    extracted: list[int | plc.Column] = []
-    for value, component in zip(
-        replaced,
-        (
-            plc.datetime.DatetimeComponent.YEAR,
-            plc.datetime.DatetimeComponent.MONTH,
-            plc.datetime.DatetimeComponent.DAY,
+    has_31_days = _op(
+        _AST.EQUAL,
+        _op(
+            _AST.MOD,
+            _op(_AST.ADD, month, _op(_AST.DIV, month, _int64_literal(8, stream))),
+            _int64_literal(2, stream),
         ),
-        strict=True,
-    ):
-        if value is None:
-            extracted.append(
-                plc.unary.cast(
-                    plc.datetime.extract_datetime_component(
-                        within_cycle, component, stream=stream
+        _int64_literal(1, stream),
+    )
+    is_february = _op(_AST.EQUAL, month, _int64_literal(2, stream))
+    fits_month = _op(
+        _AST.LOGICAL_OR,
+        _op(_AST.LESS_EQUAL, day, _int64_literal(28, stream)),
+        _op(
+            _AST.LOGICAL_OR,
+            all_of(
+                _op(_AST.NOT, is_february),
+                _op(
+                    _AST.LOGICAL_OR,
+                    _op(_AST.LESS_EQUAL, day, _int64_literal(30, stream)),
+                    _op(
+                        _AST.LOGICAL_AND,
+                        _op(_AST.EQUAL, day, _int64_literal(31, stream)),
+                        has_31_days,
                     ),
-                    _INT64,
-                    stream=stream,
-                )
-            )
-        else:
-            extracted.append(value)
-    year, month, day_of_month = extracted
-    if isinstance(year, plc.Column):
-        year = _evaluate_int64(
-            [ticks, year],
-            plc.expressions.Operation(
-                _AST.ADD,
-                plc.expressions.ColumnReference(1),
-                plc.expressions.Operation(
-                    _AST.MUL,
-                    plc.expressions.Operation(_AST.FLOOR_DIV, days, cycle),
-                    _int64_literal(400, stream),
                 ),
             ),
-            stream,
-        )
-    return year, month, day_of_month
+            all_of(
+                is_february, _op(_AST.EQUAL, day, _int64_literal(29, stream)), is_leap
+            ),
+        ),
+    )
+    return all_of(
+        _op(_AST.GREATER_EQUAL, month, _int64_literal(1, stream)),
+        _op(_AST.LESS_EQUAL, month, _int64_literal(12, stream)),
+        _op(_AST.GREATER_EQUAL, day, _int64_literal(1, stream)),
+        fits_month,
+    )
 
 
-def _civil_ast(
-    components: tuple[int | plc.Column, int | plc.Column, int | plc.Column],
-    first_reference: int,
+def _is_between_ast(
+    value: plc.expressions.Expression, low: int, high: int, stream: Stream
+) -> plc.expressions.Expression:
+    return _op(
+        _AST.LOGICAL_AND,
+        _op(_AST.GREATER_EQUAL, value, _int64_literal(low, stream)),
+        _op(_AST.LESS_EQUAL, value, _int64_literal(high, stream)),
+    )
+
+
+def _fits_int64_ast(
+    days: plc.expressions.Expression,
+    time_of_day: plc.expressions.Expression,
+    ticks_per_day: int,
     stream: Stream,
-) -> tuple[
-    tuple[
-        plc.expressions.Expression,
-        plc.expressions.Expression,
-        plc.expressions.Expression,
-    ],
-    tuple[plc.Column, ...],
-]:
-    """
-    AST operands for ``components``, and the columns they reference.
+) -> plc.expressions.Expression:
+    """AST of whether ``days * ticks_per_day + time_of_day`` fits in INT64."""
+    first_day, first_time = divmod(-(2**63), ticks_per_day)
+    last_day, last_time = divmod(2**63 - 1, ticks_per_day)
 
-    The columns are referenced from index ``first_reference`` on.
-    """
-    operands: list[plc.expressions.Expression] = []
-    columns: list[plc.Column] = []
-    for component in components:
-        if isinstance(component, plc.Column):
-            operands.append(
-                plc.expressions.ColumnReference(first_reference + len(columns))
-            )
-            columns.append(component)
-        else:
-            operands.append(_int64_literal(component, stream))
-    year, month, day = operands
-    return (year, month, day), tuple(columns)
-
-
-def _check_civil_components(
-    components: tuple[int | plc.Column, int | plc.Column, int | plc.Column],
-    column: plc.Column,
-    stream: Stream,
-) -> None:
-    """
-    Raise like polars if a non-null row of ``column`` gets an invalid date.
-
-    Columns in ``components`` are INT64, null exactly where ``column`` is.
-    """
-    operands, columns = _civil_ast(components, 0, stream)
-    if not columns:
-        if column.null_count() < column.size() and not _is_valid_date(
-            *cast("tuple[int, int, int]", components)
-        ):
-            raise ComputeError(f"Invalid date components {components} supplied")
-        return
-    is_invalid = plc.transform.compute_column(
-        plc.Table(list(columns)),
-        plc.expressions.Operation(_AST.NOT, _is_valid_date_ast(*operands, stream)),
-        stream=stream,
-    )
-    if not plc.reduce.reduce(
-        is_invalid,
-        plc.aggregation.any(),
-        plc.DataType(plc.TypeId.BOOL8),
-        stream=stream,
-    ).to_py(stream=stream):
-        return
-    invalid_rows = iter(
-        plc.stream_compaction.apply_retention_mask(
-            plc.Table(list(columns)), is_invalid, stream=stream
-        ).columns()
-    )
-    first_invalid = tuple(
-        plc.copying.get_element(next(invalid_rows), 0, stream=stream).to_py(
-            stream=stream
+    def on_day(
+        day: int, time_test: plc.expressions.Expression
+    ) -> plc.expressions.Expression:
+        return _op(
+            _AST.LOGICAL_AND,
+            _op(_AST.EQUAL, days, _int64_literal(day, stream)),
+            time_test,
         )
-        if isinstance(component, plc.Column)
-        else component
-        for component in components
+
+    return _op(
+        _AST.LOGICAL_OR,
+        _is_between_ast(days, first_day + 1, last_day - 1, stream),
+        _op(
+            _AST.LOGICAL_OR,
+            on_day(
+                first_day,
+                _op(
+                    _AST.GREATER_EQUAL, time_of_day, _int64_literal(first_time, stream)
+                ),
+            ),
+            on_day(
+                last_day,
+                _op(_AST.LESS_EQUAL, time_of_day, _int64_literal(last_time, stream)),
+            ),
+        ),
     )
-    raise ComputeError(f"Invalid date components {first_invalid} supplied")
 
 
 def _time_of_day_ast(
-    ticks: plc.expressions.Expression,
+    time_of_day: plc.expressions.Expression,
     tick: int,
     plan: _ReplacePlan,
     stream: Stream,
 ) -> plc.expressions.Expression:
     """
-    AST of the time of day, in ticks, of INT64 ``ticks`` of ``tick`` nanoseconds.
+    AST of ``time_of_day``, in ticks of ``tick`` nanoseconds, after the plan.
 
-    The plan's time components replace those of ``ticks``.
+    Each time component the plan replaces is replaced; the others are kept.
     """
-
-    def lit(value: int) -> plc.expressions.Literal:
-        return _int64_literal(value, stream)
-
-    def op(
-        operator: plc.expressions.ASTOperator, *operands: plc.expressions.Expression
-    ) -> plc.expressions.Operation:
-        return plc.expressions.Operation(operator, *operands)
-
-    time_of_day = op(_AST.PYMOD, ticks, lit(_NANOSECONDS_PER_DAY // tick))
-    if all(component is None for component in plan[3:]):
+    if all(component is None for component in plan[3:7]):
         return time_of_day
     hour, minute, second = (
         _NANOSECONDS_PER_UNIT[unit] // tick for unit in ("h", "m", "s")
     )
     parts = (
         (
-            op(_AST.DIV, time_of_day, lit(hour))
+            _op(_AST.DIV, time_of_day, _int64_literal(hour, stream))
             if plan.hour is None
-            else lit(plan.hour),
+            else _int64_literal(plan.hour, stream),
             hour,
         ),
         (
-            op(_AST.MOD, op(_AST.DIV, time_of_day, lit(minute)), lit(60))
+            _op(
+                _AST.MOD,
+                _op(_AST.DIV, time_of_day, _int64_literal(minute, stream)),
+                _int64_literal(60, stream),
+            )
             if plan.minute is None
-            else lit(plan.minute),
+            else _int64_literal(plan.minute, stream),
             minute,
         ),
         (
-            op(_AST.MOD, op(_AST.DIV, time_of_day, lit(second)), lit(60))
+            _op(
+                _AST.MOD,
+                _op(_AST.DIV, time_of_day, _int64_literal(second, stream)),
+                _int64_literal(60, stream),
+            )
             if plan.second is None
-            else lit(plan.second),
+            else _int64_literal(plan.second, stream),
             second,
         ),
         (
-            op(_AST.MOD, time_of_day, lit(second))
+            _op(_AST.MOD, time_of_day, _int64_literal(second, stream))
             if plan.microsecond is None
-            else lit(plan.microsecond * _NANOSECONDS_PER_UNIT["us"] // tick),
+            else _int64_literal(
+                plan.microsecond * _NANOSECONDS_PER_UNIT["us"] // tick, stream
+            ),
             1,
         ),
     )
-    result, *rest = (op(_AST.MUL, value, lit(scale)) for value, scale in parts)
+    result, *rest = (
+        _op(_AST.MUL, value, _int64_literal(scale, stream)) for value, scale in parts
+    )
     for part in rest:
-        result = op(_AST.ADD, result, part)
+        result = _op(_AST.ADD, result, part)
     return result
+
+
+def _raise_on_invalid_rows(
+    columns: list[plc.Column],
+    invalid_date: plc.expressions.Expression | None,
+    out_of_range: plc.expressions.Expression | None,
+    date: tuple[
+        plc.expressions.Expression,
+        plc.expressions.Expression,
+        plc.expressions.Expression,
+    ]
+    | None,
+    stream: Stream,
+) -> None:
+    """
+    Raise if a non-null row of ``columns[0]`` gets an invalid result.
+
+    The expressions reference ``columns``. Checking synchronizes the stream.
+    The first such row decides the error.
+    """
+    table = plc.Table(columns)
+    tests = tuple(test for test in (invalid_date, out_of_range) if test is not None)
+    is_invalid = tests[0] if len(tests) == 1 else _op(_AST.LOGICAL_OR, *tests)
+    is_invalid = _op(
+        _AST.LOGICAL_AND,
+        is_invalid,
+        _op(_AST.NOT, _op(_AST.IS_NULL, plc.expressions.ColumnReference(0))),
+    )
+    invalid = plc.transform.compute_column(table, is_invalid, stream=stream)
+    if not plc.reduce.reduce(
+        invalid, plc.aggregation.any(), plc.DataType(plc.TypeId.BOOL8), stream=stream
+    ).to_py(stream=stream):
+        return
+    if invalid_date is not None and date is not None:
+        first_invalid = plc.stream_compaction.apply_retention_mask(
+            plc.Table(
+                [
+                    plc.transform.compute_column(
+                        table, _op(_AST.IDENTITY, expression), stream=stream
+                    )
+                    for expression in (invalid_date, *date)
+                ]
+            ),
+            invalid,
+            stream=stream,
+        ).columns()
+        is_invalid_date, *components = (
+            plc.copying.get_element(column, 0, stream=stream).to_py(stream=stream)
+            for column in first_invalid
+        )
+        if is_invalid_date:
+            raise ComputeError(f"Invalid date components {tuple(components)} supplied")
+    raise ComputeError("dt.replace result is out of range for time unit 'ns'")
 
 
 def _replace(column: plc.Column, plan: _ReplacePlan, stream: Stream) -> plc.Column:
@@ -1475,22 +1557,21 @@ def _replace(column: plc.Column, plan: _ReplacePlan, stream: Stream) -> plc.Colu
 
     Returns
     -------
-    The column with the plan's components replaced. If the plan replaces
-    nothing, this is ``column`` itself rather than a copy.
+    The column with the plan's components replaced.
 
     Raises
     ------
     ComputeError
-        If a non-null row gets an invalid date, like polars. Checking this
-        synchronizes the stream.
+        If a non-null row gets an invalid date, like polars, or a nanosecond
+        result does not fit in 64 bits, where polars panics. These checks
+        synchronize the stream; they run only for plans that can give an
+        invalid date, and for nanosecond inputs whose year is kept.
 
     Notes
     -----
-    polars panics if a nanosecond result does not fit in 64 bits; here it
-    wraps.
+    Like polars, rows outside chrono's years -262143 to 262142 are null
+    unless every component is replaced, and they never raise.
     """
-    if all(component is None for component in plan):
-        return column
     on_date = column.type().id() == plc.TypeId.TIMESTAMP_DAYS
     if on_date:
         ticks = plc.unary.cast(
@@ -1504,33 +1585,74 @@ def _replace(column: plc.Column, plan: _ReplacePlan, stream: Stream) -> plc.Colu
         tick = _TIMESTAMP_TICK_NANOSECONDS[column.type().id()]
     ticks_per_day = _NANOSECONDS_PER_DAY // tick
     ticks_ref = plc.expressions.ColumnReference(0)
-    days: plc.expressions.Expression = plc.expressions.Operation(
-        _AST.FLOOR_DIV, ticks_ref, _int64_literal(ticks_per_day, stream)
-    )
-    columns: tuple[plc.Column, ...] = ()
-    if any(component is not None for component in plan[:3]):
-        components = _civil_components(ticks, ticks_per_day, plan, stream)
-        _check_civil_components(components, column, stream)
-        operands, columns = _civil_ast(components, 1, stream)
-        days = _days_from_civil_ast(*operands, stream)
-    result = plc.expressions.Operation(
-        _AST.MUL, days, _int64_literal(ticks_per_day, stream)
-    )
-    if not on_date:
-        result = plc.expressions.Operation(
-            _AST.ADD, result, _time_of_day_ast(ticks_ref, tick, plan, stream)
+    days = _op(_AST.FLOOR_DIV, ticks_ref, _int64_literal(ticks_per_day, stream))
+    columns = [ticks]
+    date = None
+    new_days: plc.expressions.Expression = days
+    if any(value is not None for value in plan[:3]):
+        date, civil = _civil_operands(ticks, ticks_per_day, plan, stream)
+        columns.extend(civil)
+        columns.append(
+            _evaluate_int64(columns, _days_from_civil_ast(*date, stream), stream)
         )
-    replaced = _evaluate_int64([ticks, *columns], result, stream)
+        new_days = plc.expressions.ColumnReference(len(columns) - 1)
+    new_time_of_day = _time_of_day_ast(
+        _op(_AST.PYMOD, ticks_ref, _int64_literal(ticks_per_day, stream)),
+        tick,
+        plan,
+        stream,
+    )
+    keeps_a_component = None in (plan[:3] if on_date else plan[:7])
+    in_chrono_range = (
+        _is_between_ast(days, *_CHRONO_DAYS, stream)
+        if keeps_a_component and tick > 1
+        else None
+    )
+    invalid_date = (
+        _op(_AST.NOT, _is_valid_date_ast(*date, stream))
+        if plan.check_date and date is not None
+        else None
+    )
+    if invalid_date is not None and in_chrono_range is not None:
+        invalid_date = _op(_AST.LOGICAL_AND, in_chrono_range, invalid_date)
+    out_of_range = (
+        _op(
+            _AST.NOT,
+            _fits_int64_ast(new_days, new_time_of_day, ticks_per_day, stream),
+        )
+        if tick == 1 and plan.year is None
+        else None
+    )
+    if invalid_date is not None or out_of_range is not None:
+        _raise_on_invalid_rows(columns, invalid_date, out_of_range, date, stream)
+    replaced = (
+        columns[-1]
+        if on_date
+        else _evaluate_int64(
+            columns,
+            _op(
+                _AST.ADD,
+                _op(_AST.MUL, new_days, _int64_literal(ticks_per_day, stream)),
+                new_time_of_day,
+            ),
+            stream,
+        )
+    )
     if on_date:
         replaced = plc.unary.cast(
             replaced, plc.DataType(plc.TypeId.INT32), stream=stream
         )
     replaced = plc.unary.bit_cast(replaced, column.type(), stream=stream)
-    if column.null_count() == 0:
-        return replaced
-    return replaced.with_mask(
-        plc.null_mask.copy_bitmask(column, stream=stream), column.null_count()
-    )
+    if in_chrono_range is not None:
+        mask, null_count = plc.transform.bools_to_mask(
+            _evaluate_int64([ticks], in_chrono_range, stream), stream=stream
+        )
+        return replaced.with_mask(mask, null_count)
+    if not keeps_a_component and column.null_count() > 0:
+        return replaced.with_mask(
+            plc.null_mask.copy_bitmask(column, stream=stream), column.null_count()
+        )
+    return replaced
 
 
 class TemporalFunction(Expr):
@@ -1742,10 +1864,12 @@ class TemporalFunction(Expr):
         """Evaluate this expression given a dataframe for context."""
         if self.name is TemporalFunction.Name.Replace:
             column = self.children[0].evaluate(df, context=context)
-            return Column(
-                _replace(column.obj, cast("_ReplacePlan", self.options), df.stream),
-                dtype=self.dtype,
-            )
+            plan = cast("_ReplacePlan", self.options)
+            if column.obj.type().id() == plc.TypeId.TIMESTAMP_NANOSECONDS and all(
+                component is None for component in plan[:7]
+            ):
+                return Column(column.obj, dtype=self.dtype).sorted_like(column)
+            return Column(_replace(column.obj, plan, df.stream), dtype=self.dtype)
         columns = [child.evaluate(df, context=context) for child in self.children]
         if self.name is TemporalFunction.Name.ConvertTimeZone:
             (column,) = columns

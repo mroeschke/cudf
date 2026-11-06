@@ -1296,9 +1296,10 @@ def _(
     dtype: DataType,
     schema: Schema,
 ) -> expr.Expr:
-    function_data = node.function_data
     function_data = (
-        function_data if isinstance(function_data, tuple) else (function_data,)
+        node.function_data
+        if isinstance(node.function_data, tuple)
+        else (node.function_data,)
     )
     previous = translator._list_literals_as_elements
     translator._list_literals_as_elements = function_data[0] in _LIST_LITERAL_CONSUMERS

@@ -9,8 +9,10 @@ from typing import Any, Literal, cast
 import pytest
 
 import polars as pl
+from polars.testing import assert_frame_equal
 
 from cudf_polars.dsl.expr import TemporalFunction
+from cudf_polars.dsl.translate import Translator
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
     assert_ir_translation_raises,
@@ -1294,19 +1296,26 @@ def test_datetime_combine_integer_time_unsupported(in_memory_engine: pl.GPUEngin
 
 
 @pytest.mark.parametrize(
-    "component, value",
+    "kwargs",
     [
-        ("year", 2023),
-        ("month", 3),
-        ("day", 9),
-        ("hour", 5),
-        ("minute", 6),
-        ("second", 7),
-        ("microsecond", 8),
+        {},
+        {"year": 2023},
+        {"month": 3},
+        {"day": 9},
+        {"hour": 5},
+        {"minute": 6},
+        {"second": 7},
+        {"microsecond": 8},
+        {"year": 2020, "month": 2, "day": 29},
     ],
+    ids=repr,
 )
 def test_datetime_replace(
-    engine: pl.GPUEngine, time_unit, with_nulls, component: str, value: int
+    engine: pl.GPUEngine,
+    kwargs: dict[str, Any],
+    *,
+    time_unit: Literal["ms", "us", "ns"],
+    with_nulls: bool,
 ):
     values: list[datetime.datetime | None] = [
         datetime.datetime(2024, 1, 31, 1, 2, 3, 456789),
@@ -1321,7 +1330,6 @@ def test_datetime_replace(
         .dt.offset_by("123ns")
         .dt.cast_time_unit(time_unit)
     )
-    kwargs: dict[str, Any] = {component: value}
     q = pl.LazyFrame({"a": series}).select(pl.col("a").dt.replace(**kwargs))
     assert_gpu_result_equal(q, engine=engine)
 
@@ -1332,7 +1340,7 @@ def test_datetime_replace(
     ids=repr,
 )
 def test_datetime_replace_date(
-    engine: pl.GPUEngine, with_nulls, kwargs: dict[str, Any]
+    engine: pl.GPUEngine, kwargs: dict[str, Any], *, with_nulls: bool
 ):
     values: list[datetime.date | None] = [
         datetime.date(2024, 1, 31),
@@ -1345,12 +1353,102 @@ def test_datetime_replace_date(
     assert_gpu_result_equal(q, engine=engine)
 
 
-def test_datetime_replace_invalid_date_raises(engine: pl.GPUEngine):
+def test_datetime_replace_years_outside_int16(engine: pl.GPUEngine):
     ldf = pl.LazyFrame(
-        {"a": [None, datetime.datetime(2024, 1, 31), datetime.datetime(2023, 1, 1)]}
+        {"a": pl.Series([40_000 * 365, -40_000 * 365], dtype=pl.Int32).cast(pl.Date)}
     )
-    q = ldf.select(pl.col("a").dt.replace(month=2, day=30))
-    match = r"Invalid date components \(2024, 2, 30\) supplied"
+    q = ldf.select(pl.col("a").dt.replace(day=1))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "kwargs, replaced",
+    [
+        ({}, None),
+        ({"day": 1}, None),
+        ({"month": 2, "day": 31}, None),
+        ({"year": 2000, "month": 1, "day": 1}, datetime.date(2000, 1, 1)),
+    ],
+    ids=repr,
+)
+def test_datetime_replace_outside_chrono_range(
+    engine: pl.GPUEngine, kwargs: dict[str, Any], replaced: datetime.date | None
+):
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series([-2_000_000_000, 2_000_000_000, None], dtype=pl.Int32).cast(
+                pl.Date
+            )
+        }
+    )
+    q = ldf.select(pl.col("a").dt.replace(**kwargs))
+    expect = pl.DataFrame({"a": pl.Series([replaced, replaced, None], dtype=pl.Date)})
+    # polars' streaming engine gives these rows; its in-memory engine gives the epoch
+    assert_frame_equal(q.collect(engine=engine), expect)
+
+
+def test_datetime_replace_ambiguous_column(engine: pl.GPUEngine):
+    ldf = pl.LazyFrame({"a": [datetime.datetime(2024, 1, 31)], "b": ["earliest"]})
+    q = ldf.select(pl.col("a").dt.replace(hour=1, ambiguous=pl.col("b")))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("dtype", [pl.Date(), pl.Datetime("us")], ids=repr)
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"month": 2, "day": 30}, r"\(2025, 2, 30\)"),
+        ({"month": 13}, r"\(2025, 13, 1\)"),
+        ({"day": 32}, r"\(2025, 1, 32\)"),
+        ({"year": 2023, "month": 2, "day": 29}, r"\(2023, 2, 29\)"),
+        ({"month": 2}, r"\(2023, 2, 31\)"),
+    ],
+    ids=repr,
+)
+def test_datetime_replace_invalid_date_raises(
+    engine: pl.GPUEngine, dtype: pl.DataType, kwargs: dict[str, Any], match: str
+):
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [None, datetime.datetime(2025, 1, 1), datetime.datetime(2023, 1, 31)]
+            ).cast(dtype)
+        }
+    )
+    q = ldf.select(pl.col("a").dt.replace(**kwargs))
+    match = rf"Invalid date components {match} supplied"
+    if is_streaming_engine(engine):
+        with pytest.RaisesGroup(
+            pytest.RaisesExc(pl.exceptions.ComputeError, match=match)
+        ):
+            q.collect(engine=engine)
+    else:
+        with pytest.raises(pl.exceptions.ComputeError, match=match):
+            q.collect(engine=engine)
+
+
+@pytest.mark.parametrize(
+    "value, kwargs",
+    [
+        (datetime.datetime(2262, 4, 11, 23), {"minute": 59}),
+        (datetime.datetime(2262, 4, 1), {"month": 12}),
+        (datetime.datetime(1677, 9, 21, 1), {"hour": 0}),
+    ],
+    ids=repr,
+)
+def test_datetime_replace_nanosecond_out_of_range_raises(
+    engine: pl.GPUEngine, value: datetime.datetime, kwargs: dict[str, Any]
+):
+    # polars panics instead, as it unwraps the overflowing timestamp
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series(
+                [None, value, datetime.datetime(2000, 1, 1)], dtype=pl.Datetime("ns")
+            )
+        }
+    )
+    q = ldf.select(pl.col("a").dt.replace(**kwargs))
+    match = "out of range for time unit 'ns'"
     if is_streaming_engine(engine):
         with pytest.RaisesGroup(
             pytest.RaisesExc(pl.exceptions.ComputeError, match=match)
@@ -1376,52 +1474,38 @@ def test_datetime_replace_invalid_date_without_valid_rows(
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "dtype, kwargs",
     [
-        {"year": "b"},
-        {"year": 2023.0},
-        {"month": 300},
-        {"hour": 24},
-        {"microsecond": 1_000_000},
+        (pl.Datetime("us"), {"year": "b"}),
+        (pl.Datetime("us"), {"year": 2023.0}),
+        (pl.Datetime("us"), {"month": 300}),
+        (pl.Datetime("us"), {"hour": 24}),
+        (pl.Datetime("us"), {"microsecond": 1_000_000}),
+        (pl.Datetime("ns"), {"year": 2300}),
+        (pl.Datetime("us", time_zone="Europe/London"), {"hour": 1}),
     ],
     ids=repr,
 )
 def test_datetime_replace_unsupported(
-    in_memory_engine: pl.GPUEngine, kwargs: dict[str, Any]
+    in_memory_engine: pl.GPUEngine, dtype: pl.DataType, kwargs: dict[str, Any]
 ):
-    ldf = pl.LazyFrame({"a": [datetime.datetime(2024, 1, 31)], "b": [2023]})
+    ldf = pl.LazyFrame(
+        {
+            "a": pl.Series([datetime.datetime(2024, 1, 31)], dtype=dtype),
+            "b": [2023],
+        }
+    )
     q = ldf.select(pl.col("a").dt.replace(**kwargs))
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
-def test_datetime_replace_non_literal_ambiguous_unsupported(
+def test_datetime_replace_computed_ambiguous_unsupported(
     in_memory_engine: pl.GPUEngine,
 ):
-    ldf = pl.LazyFrame({"a": [datetime.datetime(2024, 1, 31)], "b": ["earliest"]})
-    q = ldf.select(pl.col("a").dt.replace(hour=1, ambiguous=pl.col("b")))
-    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
-
-
-def test_datetime_replace_nanosecond_year_out_of_range_unsupported(
-    in_memory_engine: pl.GPUEngine,
-):
-    ldf = pl.LazyFrame(
-        {"a": pl.Series([datetime.datetime(2024, 1, 31)], dtype=pl.Datetime("ns"))}
+    ldf = pl.LazyFrame({"a": [datetime.datetime(2024, 1, 31)], "b": ["EARLIEST"]})
+    q = ldf.select(
+        pl.col("a").dt.replace(hour=1, ambiguous=pl.col("b").str.to_lowercase())
     )
-    q = ldf.select(pl.col("a").dt.replace(year=2300))
-    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
-
-
-def test_datetime_replace_time_zone_unsupported(in_memory_engine: pl.GPUEngine):
-    ldf = pl.LazyFrame(
-        {
-            "a": pl.Series(
-                [datetime.datetime(2024, 1, 31)],
-                dtype=pl.Datetime("us", time_zone="Europe/London"),
-            )
-        }
-    )
-    q = ldf.select(pl.col("a").dt.replace(hour=1))
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
@@ -1429,4 +1513,11 @@ def test_datetime_replace_non_temporal_raises(in_memory_engine: pl.GPUEngine):
     q = pl.LazyFrame({"a": [1]}).select(pl.col("a").dt.replace(year=2023))
     assert_ir_translation_raises(
         q, in_memory_engine, pl.exceptions.InvalidOperationError
+    )
+    translator = Translator(q._ldf.visit(), in_memory_engine)
+    translator.translate_ir()
+    assert any(
+        "`round` operation not supported for dtype `i64` (expected: date/datetime)"
+        in str(e)
+        for e in translator.errors
     )
