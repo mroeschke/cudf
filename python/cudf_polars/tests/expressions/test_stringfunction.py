@@ -1082,6 +1082,124 @@ def test_split_regex_not_supported(engine: pl.GPUEngine):
     assert_ir_translation_raises(q, engine, NotImplementedError)
 
 
+@pytest.mark.parametrize("inclusive", [False, True])
+@pytest.mark.parametrize("by", [",", " ", "ab", "", "_", ".*", ",,"])
+def test_str_split(engine: pl.GPUEngine, by: str, *, inclusive: bool) -> None:
+    lf = pl.LazyFrame(
+        {
+            "a": [
+                "a,b",
+                "",
+                None,
+                ",x,",
+                "abc",
+                "a  b",
+                "a_a",
+                "c_c_c",
+                "a, b",
+                "ab,c,de",
+                ",,,",
+                "日,本,",
+                "x.*y\n.*",
+                "e\u0301,👍🏽",
+            ]
+        }
+    )
+    q = lf.select(pl.col("a").str.split(by, inclusive=inclusive))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+@pytest.mark.parametrize("by", [",", ""])
+def test_str_split_no_rows(engine: pl.GPUEngine, by: str, *, inclusive: bool) -> None:
+    lf = pl.LazyFrame({"a": ["a,b", None]})
+    q = lf.head(0).select(pl.col("a").str.split(by, inclusive=inclusive))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+@pytest.mark.parametrize("by", [",", ""])
+@pytest.mark.parametrize(
+    "data", [[None, None], ["", ""], ["", None]], ids=["nulls", "empty", "mixed"]
+)
+def test_str_split_no_pieces(
+    engine: pl.GPUEngine, data: list[str | None], by: str, *, inclusive: bool
+) -> None:
+    lf = pl.LazyFrame({"a": pl.Series(data, dtype=pl.String)})
+    q = lf.select(pl.col("a").str.split(by, inclusive=inclusive))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+@pytest.mark.parametrize("by", [",", ""])
+@pytest.mark.parametrize(
+    "offset,length", [(1, 3), (4, 2), (2, 4)], ids=["no_nulls", "all_nulls", "mixed"]
+)
+def test_str_split_sliced_input(
+    engine: pl.GPUEngine, offset: int, length: int, by: str, *, inclusive: bool
+) -> None:
+    lf = pl.LazyFrame(
+        {
+            "a": ["x,y", "a,b,", ",,", "日,é", None, None, "q"],
+            "k": [6, 5, 4, 3, 2, 1, 0],
+        }
+    )
+    q = (
+        lf.sort("k", descending=True)
+        .slice(offset, length)
+        .select(pl.col("a").str.split(by, inclusive=inclusive))
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+def test_str_split_literal_input(engine: pl.GPUEngine, *, inclusive: bool) -> None:
+    lf = pl.LazyFrame({"b": [1, 2, 3]})
+    q = lf.select(
+        pl.lit(pl.Series("a", ["a, b", "a", "ab,c,de"])).str.split(
+            ",", inclusive=inclusive
+        ),
+        pl.lit("a,b").str.split(",", inclusive=inclusive).alias("scalar"),
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+def test_str_split_nul_separator(engine: pl.GPUEngine, *, inclusive: bool) -> None:
+    lf = pl.LazyFrame({"a": ["a\x00b", "\x00", "ab", "a\x00", None]})
+    q = lf.select(pl.col("a").str.split("\x00", inclusive=inclusive))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+def test_str_split_null_separator(engine: pl.GPUEngine, *, inclusive: bool) -> None:
+    lf = pl.LazyFrame({"a": ["a,b", None, ""]})
+    q = lf.select(
+        pl.col("a").str.split(pl.lit(None, dtype=pl.String), inclusive=inclusive),
+        pl.lit("a,b")
+        .str.split(pl.lit(None, dtype=pl.String), inclusive=inclusive)
+        .alias("scalar"),
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+@pytest.mark.parametrize("separator", ["column", "int", "float", "bool", "null"])
+def test_str_split_separator_not_supported(
+    in_memory_engine: pl.GPUEngine, separator: str, *, inclusive: bool
+) -> None:
+    lf = pl.LazyFrame({"s": ["a,b", "a;b"], "sep": [",", ";"]})
+    by = {
+        "column": pl.col("sep"),
+        "int": pl.lit(1),
+        "float": pl.lit(1.5),
+        "bool": pl.lit(value=True),
+        "null": pl.lit(None),
+    }[separator]
+    q = lf.select(pl.col("s").str.split(by, inclusive=inclusive))
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
 @pytest.mark.parametrize(
     "data",
     [

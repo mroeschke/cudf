@@ -21,12 +21,14 @@ from cudf_polars.containers import Column
 from cudf_polars.dsl.expressions.base import ExecutionContext, Expr
 from cudf_polars.dsl.expressions.literal import Literal, LiteralColumn
 from cudf_polars.dsl.utils.reshape import broadcast
-from cudf_polars.utils.dtypes import make_empty_column
+from cudf_polars.utils.dtypes import make_all_null_column, make_empty_column
 
 if TYPE_CHECKING:
     from typing import Self
 
     from polars import _plr as polars
+
+    from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers import DataFrame, DataType
 
@@ -49,6 +51,146 @@ def _dtypes_for_json_decode(dtype: DataType) -> JsonDecodeType:
         ]
     else:
         return []
+
+
+def _split_inclusive(
+    strings: plc.Column, separator: plc.Scalar, stream: Stream
+) -> plc.Column:
+    """
+    Split strings on a non-empty separator, keeping the separator on each piece.
+
+    Parameters
+    ----------
+    strings
+        Strings column to split, valid on ``stream``, with a zero offset
+        and at least one valid row.
+    separator
+        Non-empty string scalar, valid on ``stream``.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+
+    Returns
+    -------
+    A lists column with the pieces of each string. An empty trailing
+    piece is dropped, like Polars ``str.split(..., inclusive=True)``.
+    """
+    lists = plc.strings.split.split.split_record(strings, separator, -1, stream=stream)
+    view = lists.list_view()
+    offsets = view.offsets()
+    pieces = view.child()
+    int32 = offsets.type()
+    (ends,) = plc.copying.slice(offsets, [1, offsets.size()], stream=stream)
+    last = plc.binaryop.binary_operation(
+        ends,
+        plc.Scalar.from_py(1, int32, stream=stream),
+        plc.binaryop.BinaryOperator.SUB,
+        int32,
+        stream=stream,
+    )
+    if strings.null_count() > 0:
+        (last,) = plc.stream_compaction.apply_retention_mask(
+            plc.Table([last]), plc.unary.is_valid(strings, stream=stream), stream=stream
+        ).columns()
+    (not_last,) = plc.copying.scatter(
+        [plc.Scalar.from_py(False, stream=stream)],  # noqa: FBT003
+        last,
+        plc.Table(
+            [
+                plc.Column.from_scalar(
+                    plc.Scalar.from_py(True, stream=stream),  # noqa: FBT003
+                    pieces.size(),
+                    stream=stream,
+                )
+            ]
+        ),
+        stream=stream,
+    ).columns()
+    # TODO: Handle long inclusive pieces without concatenate
+    appended = plc.strings.combine.concatenate(
+        plc.Table(
+            [
+                pieces,
+                plc.Column.from_scalar(
+                    separator, pieces.size(), stream=stream
+                ).with_mask(*plc.transform.bools_to_mask(not_last, stream=stream)),
+            ]
+        ),
+        plc.Scalar.from_py("", stream=stream),
+        plc.Scalar.from_py("", stream=stream),
+        stream=stream,
+    )
+    bool8 = not_last.type()
+    keep = plc.binaryop.binary_operation(
+        not_last,
+        plc.binaryop.binary_operation(
+            pieces,
+            plc.Scalar.from_py("", stream=stream),
+            plc.binaryop.BinaryOperator.NOT_EQUAL,
+            bool8,
+            stream=stream,
+        ),
+        plc.binaryop.BinaryOperator.LOGICAL_OR,
+        bool8,
+        stream=stream,
+    )
+    list_type = lists.type()
+    return plc.lists.apply_retention_mask(
+        plc.Column(
+            list_type,
+            lists.size(),
+            None,
+            lists.null_mask(),
+            lists.null_count(),
+            0,
+            [offsets, appended],
+        ),
+        plc.Column(list_type, lists.size(), None, None, 0, 0, [offsets, keep]),
+        stream=stream,
+    )
+
+
+def _split_characters(strings: plc.Column, stream: Stream) -> plc.Column:
+    """
+    Split strings into lists of characters.
+
+    Parameters
+    ----------
+    strings
+        Strings column to split, valid on ``stream``, with a zero offset
+        and at least one valid row.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+
+    Returns
+    -------
+    A lists column with the characters of each string.
+    """
+    has_nulls = strings.null_count() > 0
+    tokens = plc.nvtext.tokenize.character_tokenize(
+        plc.replace.replace_nulls(
+            strings, plc.Scalar.from_py("", stream=stream), stream=stream
+        )
+        if has_nulls
+        else strings,
+        stream=stream,
+    )
+    offsets, characters = tokens.children()
+    # character_tokenize returns 0 rows when the strings have no bytes: https://github.com/rapidsai/cudf/blob/d71b3b743ca6fc9d8d4b1718d845eec4bc63dee6/cpp/src/text/tokenize.cu#L183-L186
+    if tokens.size() == 0:
+        offsets = plc.Column.from_scalar(
+            plc.Scalar.from_py(0, offsets.type(), stream=stream),
+            strings.size() + 1,
+            stream=stream,
+        )
+    return plc.Column(
+        tokens.type(),
+        strings.size(),
+        None,
+        plc.null_mask.copy_bitmask(strings, stream=stream) if has_nulls else None,
+        strings.null_count(),
+        0,
+        [offsets, characters],
+    )
 
 
 class StringFunction(Expr):
@@ -138,6 +280,7 @@ class StringFunction(Expr):
         Name.Replace,
         Name.ReplaceMany,
         Name.Slice,
+        Name.Split,
         Name.SplitN,
         Name.SplitExact,
         Name.SplitRegex,
@@ -296,6 +439,12 @@ class StringFunction(Expr):
                 raise NotImplementedError(
                     "Slice does not support float literal start and stop values"
                 )
+        elif self.name is StringFunction.Name.Split:
+            separator = self.children[1]
+            if not isinstance(separator, Literal):
+                raise NotImplementedError("split only supports a scalar separator")
+            if separator.dtype.id() != plc.TypeId.STRING:
+                raise NotImplementedError("split only supports a string separator")
         elif self.name is StringFunction.Name.SplitExact:
             (_, inclusive) = self.options
             if inclusive:
@@ -772,6 +921,40 @@ class StringFunction(Expr):
                 ),
                 dtype=self.dtype,
             )
+        elif self.name is StringFunction.Name.Split:
+            (inclusive,) = self.options
+            child, separator = self.children
+            assert isinstance(separator, Literal)
+            column = child.evaluate(df, context=context)
+            if separator.value is None or column.null_count == column.size:
+                return Column(
+                    make_all_null_column(self.dtype, column.size, df.stream),
+                    dtype=self.dtype,
+                )
+            # libcudf mishandles a nonzero offset: https://github.com/rapidsai/cudf/blob/d71b3b743ca6fc9d8d4b1718d845eec4bc63dee6/cpp/src/text/tokenize.cu#L187-L189, https://github.com/rapidsai/cudf/blob/d71b3b743ca6fc9d8d4b1718d845eec4bc63dee6/cpp/src/strings/split/split_record.cu#L388-L395
+            strings = (
+                column.obj.copy(stream=df.stream) if column.obj.offset() else column.obj
+            )
+            if separator.value == "":
+                plc_column = _split_characters(strings, df.stream)
+            elif inclusive:
+                plc_column = _split_inclusive(
+                    strings,
+                    plc.Scalar.from_py(
+                        separator.value, separator.dtype.plc_type, stream=df.stream
+                    ),
+                    df.stream,
+                )
+            else:
+                plc_column = plc.strings.split.split.split_record(
+                    strings,
+                    plc.Scalar.from_py(
+                        separator.value, separator.dtype.plc_type, stream=df.stream
+                    ),
+                    -1,
+                    stream=df.stream,
+                )
+            return Column(plc_column, dtype=self.dtype)
         elif self.name in {
             StringFunction.Name.SplitExact,
             StringFunction.Name.SplitN,
