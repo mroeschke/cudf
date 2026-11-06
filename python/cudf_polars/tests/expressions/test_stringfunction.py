@@ -1045,6 +1045,113 @@ def test_extract_groups(engine: pl.GPUEngine, ldf_extract):
     assert_gpu_result_equal(q, engine=engine)
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"\d+",
+        r"[a-z]",
+        "a",
+        r"(?:\d)\d",
+        r"\w+",
+        r"\d+--\d+",
+        r"\[[ab]",
+        "a~~b",
+        "[]a]",
+        r"[^]\s]+",
+    ],
+)
+def test_extract_all(engine: pl.GPUEngine, pattern: str) -> None:
+    lf = pl.LazyFrame(
+        {
+            "a": [
+                "a1b22",
+                "none",
+                None,
+                "",
+                "123 bla 45 asd",
+                "xaz 678 910t",
+                "12 34",
+                "Wıth ünιcοde 日本",  # noqa: RUF001
+                "1--2 [a] a~~b ]",
+            ]
+        }
+    )
+    q = lf.select(pl.col("a").str.extract_all(pattern))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_extract_all_scalar_input(engine: pl.GPUEngine) -> None:
+    lf = pl.LazyFrame({"a": [1, 2, 3]})
+    q = lf.select(pl.lit("a12").str.extract_all(r"\d"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_extract_all_empty_frame(engine: pl.GPUEngine) -> None:
+    lf = pl.LazyFrame({"a": pl.Series([], dtype=pl.String)})
+    q = lf.select(pl.col("a").str.extract_all(r"\d+"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"(\d)(\d)?",
+        r"(\d)\d",
+        "a*",
+        r"\b",
+        "a|",
+        r"[[a]]",
+        r"[a-z&&[^aeiou]]",
+        "[a[b]]",
+        "[^[a]]",
+        "[a||b]",
+        r"\<",
+        r"\<\w",
+        r"\w\>",
+        "(?i)k",
+        "(?i:s)",
+        "a(?i)b",
+        r"\p{L}+",
+        r"\x{61}",
+    ],
+)
+def test_extract_all_pattern_unsupported(
+    in_memory_engine: pl.GPUEngine, pattern: str
+) -> None:
+    lf = pl.LazyFrame({"a": ["a1b22", None]})
+    q = lf.select(pl.col("a").str.extract_all(pattern))
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [pl.col("re"), pl.col("re").first(), pl.lit(None, dtype=pl.String)],
+    ids=["column", "first", "null"],
+)
+def test_extract_all_non_literal_pattern_unsupported(
+    in_memory_engine: pl.GPUEngine, pattern: pl.Expr
+) -> None:
+    lf = pl.LazyFrame(
+        {
+            "foo": ["ab", "abc", "abcd", "foo", None, "boo"],
+            "re": ["a", "bc", "a.c", "a", "a", None],
+        }
+    )
+    q = lf.select(pl.col("foo").str.extract_all(pattern))
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+@pytest.mark.parametrize("pattern", ["[", "x{", "a{1", r"\0", "[a[b]"])
+def test_extract_all_invalid_pattern(
+    in_memory_engine: pl.GPUEngine, pattern: str
+) -> None:
+    lf = pl.LazyFrame({"a": ["a1b22", None]})
+    q = lf.select(pl.col("a").str.extract_all(pattern))
+    with pytest.raises(pl.exceptions.ComputeError):
+        q.collect()
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
 def test_len_bytes(engine: pl.GPUEngine, ldf):
     q = ldf.select(pl.col("a").str.len_bytes())
     assert_gpu_result_equal(q, engine=engine)
