@@ -196,6 +196,7 @@ class Translator:
         self.errors: list[Exception] = []
         self._cache_nodes: dict[int, ir.Cache] = {}
         self._expr_context: ExecutionContext = ExecutionContext.FRAME
+        self._at_agg_root: bool = False
         self._internal_name_gen: Generator[str, None, None] | None = None
         self._list_literals_as_elements: bool = False
 
@@ -320,7 +321,12 @@ class Translator:
         return NotImplementedError(message, unique_errors)
 
     def translate_expr(
-        self, *, n: int, schema: Schema, allow_passthrough: bool = False
+        self,
+        *,
+        n: int,
+        schema: Schema,
+        allow_passthrough: bool = False,
+        agg_root: bool = False,
     ) -> expr.Expr:
         """
         Translate a polars-internal expression IR into our representation.
@@ -333,6 +339,9 @@ class Translator:
             Schema of the IR node this expression uses as evaluation context.
         allow_passthrough
             Whether a direct Array or Time column, or a ``dt.time()`` result, may be returned.
+        agg_root
+            Whether the node is the top-level node of a groupby or rolling
+            aggregation.
 
         Returns
         -------
@@ -378,6 +387,7 @@ class Translator:
             )
             self.errors.append(error)
             return expr.ErrorExpr(dtype, str(error))
+        self._at_agg_root = agg_root
         try:
             translated = _translate_expr(node, self, dtype, schema)
         except Exception as e:
@@ -717,7 +727,7 @@ def _(node: plrs._ir_nodes.GroupBy, translator: Translator, schema: Schema) -> i
         ]
         with set_expr_context(translator, ExecutionContext.GROUPBY):
             original_aggs = [
-                translate_named_expr(translator, n=e, schema=inp.schema)
+                translate_named_expr(translator, n=e, schema=inp.schema, agg_root=True)
                 for e in node.aggs
             ]
     if _contains_categorical_key(keys):
@@ -1203,6 +1213,7 @@ def translate_named_expr(
     n: plrs._expr_nodes.PyExprIR,
     schema: Schema,
     allow_passthrough: bool = False,
+    agg_root: bool = False,
 ) -> expr.NamedExpr:
     """
     Translate a polars-internal named expression IR object into our representation.
@@ -1217,6 +1228,8 @@ def translate_named_expr(
         Schema of the IR node this expression uses as evaluation context.
     allow_passthrough
         Whether a direct Array or Time column, or a ``dt.time()`` result, may be returned.
+    agg_root
+        Whether the expression is a groupby or rolling aggregation.
 
     Returns
     -------
@@ -1240,6 +1253,7 @@ def translate_named_expr(
             n=n.node,
             schema=schema,
             allow_passthrough=allow_passthrough,
+            agg_root=agg_root,
         ),
     )
 
@@ -1625,7 +1639,9 @@ def _(
         node.options, plrs._expr_nodes.RollingGroupOptions
     ):  # pragma: no cover; polars uses AExpr::Rolling now
         with set_expr_context(translator, ExecutionContext.ROLLING):
-            agg = translator.translate_expr(n=node.function, schema=schema)
+            agg = translator.translate_expr(
+                n=node.function, schema=schema, agg_root=True
+            )
         name_generator = translator._internal_name_gen or unique_names(schema)
         aggs, named_post_agg = decompose_single_agg(
             expr.NamedExpr(next(name_generator), agg),
@@ -1757,7 +1773,9 @@ def _translate_rolling(
 ) -> expr.Expr:
     # pl.col("a").rolling(...)
     with set_expr_context(translator, ExecutionContext.ROLLING):
-        agg_expr = translator.translate_expr(n=node.function, schema=schema)
+        agg_expr = translator.translate_expr(
+            n=node.function, schema=schema, agg_root=True
+        )
     orderby = translator.visitor.view_expression(node.index_column).name
     orderby_dtype = schema[orderby].plc_type
     if plc.traits.is_integral(orderby_dtype):
@@ -1948,17 +1966,31 @@ def _(
     node: plrs._expr_nodes.Agg, translator: Translator, dtype: DataType, schema: Schema
 ) -> expr.Expr:
     agg_name = node.name
-    args = [translator.translate_expr(n=arg, schema=schema) for arg in node.arguments]
-
-    if agg_name == "implode" and translator._expr_context in (
+    context = translator._expr_context
+    if agg_name == "implode" and context in (
         ExecutionContext.GROUPBY,
         ExecutionContext.ROLLING,
     ):
+        if not translator._at_agg_root:
+            raise NotImplementedError(
+                "implode is not supported inside another expression in group_by or rolling"
+            )
         # An element-wise expression inside a groupby/rolling aggregation is
         # wrapped in an explicit ``implode`` node. Unwrap it so the existing
         # pointwise-collect path handles it.
-        (child,) = args
+        (arg,) = node.arguments
+        child = translator.translate_expr(n=arg, schema=schema)
+        names = unique_names(schema)
+        aggs, _ = decompose_single_agg(
+            expr.NamedExpr(next(names), child), names, is_top=True, context=context
+        )
+        if any(has_agg for _, has_agg in aggs):
+            raise NotImplementedError(
+                "implode of an aggregation is not supported in group_by or rolling"
+            )
         return child
+
+    args = [translator.translate_expr(n=arg, schema=schema) for arg in node.arguments]
 
     # libcudf does not support std/var on decimal types; cast to float first.
     if agg_name in {"std", "var"} and dtype.plc_type.id() in {

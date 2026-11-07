@@ -720,6 +720,47 @@ def test_groupby_agg_broadcast_raises(engine: pl.GPUEngine, df):
 
 
 @pytest.mark.parametrize(
+    "expr",
+    [
+        pl.col("int") * 2,
+        pl.col("int").implode(),
+        pl.col("int").implode().alias("out"),
+    ],
+)
+def test_groupby_top_level_implode(engine: pl.GPUEngine, df, expr):
+    q = df.group_by("key1", maintain_order=True).agg(expr)
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pl.col("int").implode().is_null(),
+        pl.col("int").implode().fill_null(pl.lit([0])),
+        pl.coalesce(pl.col("int").implode(), pl.lit([0])),
+        pl.col("int").implode().implode(),
+    ],
+)
+def test_groupby_nested_implode_raises(in_memory_engine: pl.GPUEngine, df, expr):
+    q = df.group_by("key1", maintain_order=True).agg(expr)
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pl.col("int").sum().implode(),
+        (pl.col("int").first() * 2).implode(),
+        pl.col("int").null_count().implode(),
+        pl.len().implode(),
+    ],
+)
+def test_groupby_implode_of_agg_raises(in_memory_engine: pl.GPUEngine, df, expr):
+    q = df.group_by("key1", maintain_order=True).agg(expr)
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+@pytest.mark.parametrize(
     "dtype",
     [
         pl.List(pl.Struct({"foo": pl.Int64, "bar": pl.String})),

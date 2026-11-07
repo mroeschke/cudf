@@ -278,6 +278,43 @@ def test_rolling_ternary_unsupported(in_memory_engine, df, expr):
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
+@pytest.fixture(params=["rolling", "expr_rolling"])
+def rolling_query(request):
+    def query(df: pl.LazyFrame, expr: pl.Expr) -> pl.LazyFrame:
+        if request.param == "rolling":
+            return df.rolling("dt", period="48h").agg(expr)
+        return df.select(expr.rolling("dt", period="48h"))
+
+    return query
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pl.col("values").implode().is_null(),
+        pl.col("values").implode().fill_null(pl.lit([0])),
+        pl.coalesce(pl.col("values").implode(), pl.lit([0])),
+        pl.col("values").implode().implode(),
+    ],
+)
+def test_rolling_nested_implode_raises(in_memory_engine, df, rolling_query, expr):
+    q = rolling_query(df, expr)
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pl.col("values").sum().implode(),
+        pl.col("values").null_count().implode(),
+        pl.len().implode(),
+    ],
+)
+def test_rolling_implode_of_agg_raises(in_memory_engine, df, rolling_query, expr):
+    q = rolling_query(df, expr)
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
 def test_rolling_rank_unsupported(in_memory_engine, df):
     q = df.rolling("dt", period="48h", closed="both").agg(
         pl.col("values").rank(method="dense", descending=False)
