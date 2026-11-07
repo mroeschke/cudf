@@ -1430,6 +1430,27 @@ def _translate_function(
             options,
             *(translator.translate_expr(n=n, schema=schema) for n in node.input),
         )
+    elif isinstance(name, plrs._expr_nodes.ListFunction):
+        # TODO: Handle implode wrapped in other expressions in group_by or rolling
+        if translator._expr_context in (
+            ExecutionContext.GROUPBY,
+            ExecutionContext.ROLLING,
+        ) and any(
+            isinstance(
+                child := translator.visitor.view_expression(n), plrs._expr_nodes.Agg
+            )
+            and child.name == "implode"
+            for n in node.input
+        ):
+            raise NotImplementedError(
+                f"{name} is not supported for implode in group_by or rolling"
+            )
+        return expr.ListFunction(
+            dtype,
+            expr.ListFunction.Name.from_polars(name),
+            options,
+            *(translator.translate_expr(n=n, schema=schema) for n in node.input),
+        )
     elif isinstance(name, plrs._expr_nodes.RollingFunction):
         window_size, min_periods, weights, center, fn_params = options
         if weights is not None:

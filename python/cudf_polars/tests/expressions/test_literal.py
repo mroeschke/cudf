@@ -279,12 +279,6 @@ def test_coalesce_all_scalars_with_columns(engine: pl.GPUEngine) -> None:
     assert_gpu_result_equal(q, engine=engine)
 
 
-def test_concat_list_unsupported(engine: pl.GPUEngine) -> None:
-    df = pl.LazyFrame({"a": [[1, 2], [3]], "b": [[4], [5, 6]]})
-    q = df.select(pl.concat_list("a", "b"))
-    assert_ir_translation_raises(q, engine, NotImplementedError)
-
-
 def test_null_literal_cast_to_list(engine: pl.GPUEngine):
     df = pl.LazyFrame({"a": [1, 2, 3]})
     q = df.select(
