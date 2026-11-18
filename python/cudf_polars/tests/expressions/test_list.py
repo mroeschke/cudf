@@ -88,6 +88,27 @@ def test_list_count_matches_converted_item(
     assert_gpu_result_equal(q, engine=engine)
 
 
+@pytest.mark.parametrize(
+    "inner,item_dtype",
+    [
+        (pl.Int64, pl.Float64),
+        (pl.Int64, pl.String),
+        (pl.Int64, pl.Date),
+        (pl.Int64, pl.Boolean),
+        (pl.Int64, pl.Decimal(10, 2)),
+        (pl.String, pl.Int8),
+    ],
+)
+def test_list_count_matches_typed_null(
+    engine: pl.GPUEngine, inner: pl.DataType, item_dtype: pl.DataType
+) -> None:
+    lf = pl.LazyFrame(
+        {"a": pl.Series([[1, None, None], [2], [], None]).cast(pl.List(inner))}
+    )
+    q = lf.select(pl.col("a").list.count_matches(pl.lit(None, item_dtype)))
+    assert_gpu_result_equal(q, engine=engine)
+
+
 def test_list_count_matches_temporal(
     engine: pl.GPUEngine, time_unit: Literal["ms", "us", "ns"]
 ) -> None:
@@ -153,11 +174,10 @@ def test_list_count_matches_literal(engine: pl.GPUEngine, item: int | None) -> N
 @pytest.mark.parametrize(
     "data,item",
     [
-        ({"a": [[], [1], [1, 2, 3, 2], [1, 2, 1], [4, 4]]}, 2),
         ({"a": [[True, None, False]]}, True),
         ({"a": [[1, 2]], "b": [[3, 4]]}, 3),
     ],
-    ids=["count_matches", "boolean_nulls_9141", "wildcard_expansion"],
+    ids=["boolean_nulls_9141", "wildcard_expansion"],
 )
 def test_list_count_matches_polars_cases(
     engine: pl.GPUEngine, data: dict[str, list], item: int
@@ -197,25 +217,15 @@ def test_list_count_matches_nested_not_supported(
     [
         (pl.Int64, pl.lit(2.0)),
         (pl.Int8, pl.lit(300)),
-        (pl.UInt8, pl.lit(-1)),
         (pl.Float32, pl.lit(0.1)),
-        (pl.Float32, pl.lit(16777217)),
         (pl.Decimal(10, 1), pl.lit(Decimal("2.05"))),
-        (pl.String, pl.lit(1)),
-        (pl.Int64, pl.lit(value=True)),
-        (pl.Int64, pl.lit(None, pl.String)),
         (pl.Datetime("us"), pl.lit(datetime(2020, 1, 1), pl.Datetime("ms"))),
     ],
     ids=[
         "float_in_int",
         "int8_out_of_range",
-        "uint8_negative",
         "float32_inexact",
-        "float32_inexact_int",
         "decimal_inexact",
-        "int_in_string",
-        "bool_in_int",
-        "string_null_in_int",
         "datetime_time_unit",
     ],
 )

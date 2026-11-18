@@ -45,20 +45,27 @@ def _bool_list_like(col: plc.Column, bool_child: plc.Column) -> plc.Column:
     )
 
 
-def _count_matches_item(item: Literal, inner: DataType) -> Literal | None:
+def _count_matches_item(item: Expr, inner: DataType) -> Literal | None:
     """
     ``item`` as a literal of ``inner``, or None if the GPU can't match Polars.
 
     Polars compares the elements and ``item`` in their supertype. That is the same
     as comparing in ``inner`` only if ``item`` converts to ``inner`` exactly, and
-    the supertype doesn't lose precision of the elements.
+    the supertype doesn't lose precision of the elements, which the allowed dtype
+    pairs guarantee.
     """
+    if not isinstance(item, Literal) or inner.id() in {
+        plc.TypeId.LIST,
+        plc.TypeId.STRUCT,
+    }:
+        return None
     if item.dtype == inner:
         return item
+    if item.value is None:
+        return Literal(inner, None)
     source, target = item.dtype.polars_type, inner.polars_type
     if not (
-        isinstance(source, pl.Null)
-        or (source.is_integer() and target.is_numeric())
+        (source.is_integer() and target.is_numeric())
         or (source.is_float() and target.is_float())
         or (source.is_decimal() and target.is_decimal())
     ):
@@ -158,21 +165,12 @@ class ListFunction(Expr):
         if self.name is ListFunction.Name.CountMatches:
             column, item = self.children
             (inner,) = column.dtype.children
-            if not isinstance(item, Literal):
-                raise NotImplementedError(
-                    f"ListFunction.{self.name.name} is not supported for a "
-                    "non-literal item"
-                )
-            if inner.id() in {plc.TypeId.LIST, plc.TypeId.STRUCT}:
-                raise NotImplementedError(
-                    f"ListFunction.{self.name.name} is not supported for "
-                    f"{column.dtype.polars_type}"
-                )
             match = _count_matches_item(item, inner)
             if match is None:
                 raise NotImplementedError(
                     f"ListFunction.{self.name.name} is not supported for a "
-                    f"{item.dtype.polars_type} item in {column.dtype.polars_type}"
+                    f"{type(item).__name__} {item.dtype.polars_type} item in "
+                    f"{column.dtype.polars_type}"
                 )
             self.children = (column, match)
 
