@@ -7,8 +7,6 @@ from __future__ import annotations
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
-import polars as pl
-
 import pylibcudf as plc
 
 from cudf_polars.containers import Column
@@ -88,33 +86,26 @@ def _list_shift(column: Column, n: int, stream: Stream) -> plc.Column:
     ``column`` must be valid on ``stream``; synchronizes ``stream``.
     """
     child = column.obj.list_view().get_sliced_child(stream=stream)
-    nested = plc.traits.is_nested(child.type())
-    if nested:
-        source = plc.filling.sequence(
-            child.size(),
-            plc.Scalar.from_py(0, plc.types.SIZE_TYPE, stream=stream),
-            plc.Scalar.from_py(1, plc.types.SIZE_TYPE, stream=stream),
-            stream=stream,
-        )
-    else:
-        source = child
-    offsets, shifted, keep = _shift(column, source, n, stream)
+    indices = plc.filling.sequence(
+        child.size(),
+        plc.Scalar.from_py(0, plc.types.SIZE_TYPE, stream=stream),
+        plc.Scalar.from_py(1, plc.types.SIZE_TYPE, stream=stream),
+        stream=stream,
+    )
+    offsets, indices, keep = _shift(column, indices, n, stream)
     if keep is not None:
-        shifted = plc.copying.copy_if_else(
-            shifted,
-            plc.Scalar.from_py(
-                child.size() if nested else None, shifted.type(), stream=stream
-            ),
+        indices = plc.copying.copy_if_else(
+            indices,
+            plc.Scalar.from_py(child.size(), plc.types.SIZE_TYPE, stream=stream),
             keep,
             stream=stream,
         )
-    if nested:
-        (shifted,) = plc.copying.gather(
-            plc.Table([child]),
-            shifted,
-            plc.copying.OutOfBoundsPolicy.NULLIFY,
-            stream=stream,
-        ).columns()
+    (shifted,) = plc.copying.gather(
+        plc.Table([child]),
+        indices,
+        plc.copying.OutOfBoundsPolicy.NULLIFY,
+        stream=stream,
+    ).columns()
     return with_mask_from(
         plc.Column(
             plc.DataType(plc.TypeId.LIST),
@@ -197,18 +188,14 @@ class ListFunction(Expr):
                 raise NotImplementedError(
                     f"ListFunction.{self.name.name} is not supported for non-literal n"
                 )
-            if not (
-                isinstance(n.dtype.polars_type, pl.Null)
-                or (
-                    plc.traits.is_integral_not_bool(n.dtype.plc_type)
-                    and (n.value is None or -(2**63) <= n.value < 2**63)
-                )
-            ):
+            if n.value is not None and not plc.traits.is_integral(n.dtype.plc_type):
                 raise NotImplementedError(
                     f"ListFunction.{self.name.name} is not supported for "
                     f"n {n.value!r} of type {n.dtype.polars_type}"
                 )
-            self.options = (n.value,)
+            self.options = (
+                None if n.value is None or n.value >= 2**63 else int(n.value),
+            )
 
     def do_evaluate(
         self, df: DataFrame, *, context: ExecutionContext = ExecutionContext.FRAME
