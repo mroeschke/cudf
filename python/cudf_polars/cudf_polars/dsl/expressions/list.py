@@ -56,11 +56,12 @@ def _gather_every(
     if n == 1 and offset == 0:
         return column
     size_max = 2**31 - 1
-    int32 = plc.DataType(plc.TypeId.INT32)
     sizes = plc.lists.count_elements(column.with_mask(None, 0), stream=stream)
     positions = plc.lists.sequences(
         plc.Column.from_scalar(
-            plc.Scalar.from_py(0, int32, stream=stream), column.size(), stream=stream
+            plc.Scalar.from_py(0, plc.types.SIZE_TYPE, stream=stream),
+            column.size(),
+            stream=stream,
         ),
         sizes,
         stream=stream,
@@ -71,7 +72,7 @@ def _gather_every(
 
     def lit(value: int) -> plc.expressions.Literal:
         return plc.expressions.Literal(
-            plc.Scalar.from_py(min(value, size_max), int32, stream=stream)
+            plc.Scalar.from_py(min(value, size_max), plc.types.SIZE_TYPE, stream=stream)
         )
 
     keep = plc.transform.compute_column(
@@ -162,18 +163,20 @@ class ListFunction(Expr):
                 )
             for arg in (n, offset):
                 if arg.value is not None and not (
-                    plc.traits.is_integral_not_bool(arg.dtype.plc_type)
+                    plc.traits.is_integral(arg.dtype.plc_type)
                     and 0 <= arg.value <= _UINT32_MAX
                 ):
                     raise NotImplementedError(
                         f"ListFunction.{self.name.name} is not supported for "
                         f"n or offset {arg.value!r} of type {arg.dtype.polars_type}"
                     )
-            if n.value == 0:
+            self.options = tuple(
+                None if arg.value is None else int(arg.value) for arg in (n, offset)
+            )
+            if self.options[0] == 0:
                 raise NotImplementedError(
                     f"ListFunction.{self.name.name} is not supported for n=0"
                 )
-            self.options = (n.value, offset.value)
 
     def do_evaluate(
         self, df: DataFrame, *, context: ExecutionContext = ExecutionContext.FRAME

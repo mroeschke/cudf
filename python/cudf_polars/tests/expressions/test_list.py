@@ -64,44 +64,47 @@ def test_list_gather_every_sliced(
 
 
 @pytest.mark.parametrize(
-    "dtype", [pl.Int8, pl.Int16, pl.Int64, pl.UInt8, pl.UInt32, pl.UInt64]
-)
-def test_list_gather_every_argument_dtype(
-    engine: pl.GPUEngine, dtype: pl.DataType
-) -> None:
-    lf = pl.LazyFrame({"a": [[1, 2, 2], [None, 3], [], None, [5]]})
-    q = lf.select(
-        pl.col("a").list.gather_every(pl.lit(2, dtype=dtype), pl.lit(1, dtype=dtype))
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-@pytest.mark.parametrize(
-    "n,offset", [(2**32 - 1, 0), (1, 2**32 - 1), (2**31, 1), (1, 2**31 - 1)]
-)
-def test_list_gather_every_large_arguments(
-    engine: pl.GPUEngine, n: int, offset: int
-) -> None:
-    lf = pl.LazyFrame({"a": [[1, 2, 2], [None, 3], [], None, [5]]})
-    q = lf.select(
-        pl.col("a").list.gather_every(
-            pl.lit(n, dtype=pl.UInt32), pl.lit(offset, dtype=pl.UInt32)
-        )
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-@pytest.mark.parametrize(
     "n,offset",
     [
+        (pl.lit(2, dtype=pl.Int8), pl.lit(1, dtype=pl.Int8)),
+        (pl.lit(2, dtype=pl.Int16), pl.lit(1, dtype=pl.Int16)),
+        (pl.lit(2, dtype=pl.Int64), pl.lit(1, dtype=pl.Int64)),
+        (pl.lit(2, dtype=pl.UInt8), pl.lit(1, dtype=pl.UInt8)),
+        (pl.lit(2, dtype=pl.UInt32), pl.lit(1, dtype=pl.UInt32)),
+        (pl.lit(2, dtype=pl.UInt64), pl.lit(1, dtype=pl.UInt64)),
+        (pl.lit(2**32 - 1, dtype=pl.UInt32), 0),
+        (1, pl.lit(2**32 - 1, dtype=pl.UInt32)),
+        (pl.lit(2**31, dtype=pl.UInt32), 1),
+        (1, 2**31 - 1),
         (pl.lit(None), 1),
         (2, pl.lit(None)),
         (pl.lit(None, dtype=pl.Int64), 1),
         (2, pl.lit(None, dtype=pl.String)),
+        (pl.lit(value=True), 1),
+        (2, pl.lit(value=True)),
+        (2, pl.lit(value=False)),
     ],
-    ids=["null_n", "null_offset", "typed_null_n", "string_null_offset"],
+    ids=[
+        "int8",
+        "int16",
+        "int64",
+        "uint8",
+        "uint32",
+        "uint64",
+        "n_uint32_max",
+        "offset_uint32_max",
+        "n_above_int32",
+        "offset_int32_max",
+        "null_n",
+        "null_offset",
+        "typed_null_n",
+        "string_null_offset",
+        "bool_n",
+        "bool_offset",
+        "false_offset",
+    ],
 )
-def test_list_gather_every_null_argument(
+def test_list_gather_every_arguments(
     engine: pl.GPUEngine, n: int | pl.Expr, offset: int | pl.Expr
 ) -> None:
     lf = pl.LazyFrame({"a": [[1, 2, 2], [None, 3], [], None, [5]]})
@@ -132,69 +135,39 @@ def test_list_gather_every_literal(engine: pl.GPUEngine) -> None:
     assert_gpu_result_equal(q, engine=engine)
 
 
-def test_list_gather_every_polars_cases(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame(
-        {"lst": [[1, 2, 3], [], [4, 5], None, [6, 7, 8], [9, 10, 11, 12]]}
-    )
-    q = lf.select(all_lit=pl.col("lst").list.gather_every(2, 0))
-    assert_gpu_result_equal(q, engine=engine)
-
-
-@pytest.mark.parametrize(
-    "n,offset",
-    [
-        ("n", 0),
-        (2, "offset"),
-        ("n", "offset"),
-    ],
-    ids=["column_n", "column_offset", "column_n_and_offset"],
-)
-def test_list_gather_every_column_argument_not_supported(
-    in_memory_engine: pl.GPUEngine, n: str | int, offset: str | int
-) -> None:
-    lf = pl.LazyFrame(
-        {
-            "lst": [[1, 2, 3], [], [4, 5], None, [6, 7, 8], [9, 10, 11, 12]],
-            "n": [2, 2, 1, 3, None, 2],
-            "offset": [None, 1, 0, 1, 2, 2],
-        }
-    )
-    q = lf.select(
-        pl.col("lst").list.gather_every(
-            pl.col(n) if isinstance(n, str) else n,
-            pl.col(offset) if isinstance(offset, str) else offset,
-        )
-    )
-    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
-
-
 @pytest.mark.parametrize(
     "n,offset",
     [
         (0, 0),
+        (pl.lit(value=False), 0),
         (-1, 0),
         (2, -1),
         (2**32, 0),
         (1, 2**32),
         (pl.lit(2**63, dtype=pl.UInt64), 0),
         (pl.lit(2.0), 0),
-        (2, pl.lit(value=True)),
+        (pl.col("n"), 0),
+        (2, pl.col("offset")),
+        (pl.col("n"), pl.col("offset")),
     ],
     ids=[
         "n_zero",
+        "n_false",
         "negative_n",
         "negative_offset",
         "n_above_uint32",
         "offset_above_uint32",
         "n_above_int64",
         "float_n",
-        "bool_offset",
+        "column_n",
+        "column_offset",
+        "column_n_and_offset",
     ],
 )
 def test_list_gather_every_argument_not_supported(
     in_memory_engine: pl.GPUEngine, n: int | pl.Expr, offset: int | pl.Expr
 ) -> None:
-    lf = pl.LazyFrame({"a": [["a"], ["eb", "d"]]})
+    lf = pl.LazyFrame({"a": [["a"], ["eb", "d"]], "n": [2, None], "offset": [None, 1]})
     q = lf.select(pl.col("a").list.gather_every(n, offset))
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
