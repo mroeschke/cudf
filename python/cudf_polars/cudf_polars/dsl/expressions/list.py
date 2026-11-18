@@ -58,6 +58,9 @@ def _diff_operand(child: plc.Column, dtype: plc.DataType, stream: Stream) -> plc
 
     Like Polars, a Date that overflows as microseconds and a UInt64 that
     overflows as Int64 become null.
+
+    ``child`` must be valid on ``stream``; synchronizes ``stream`` for Date
+    and UInt64 elements.
     """
     typ = child.type()
     if typ.id() == plc.TypeId.TIMESTAMP_DAYS:
@@ -92,6 +95,58 @@ def _diff_operand(child: plc.Column, dtype: plc.DataType, stream: Stream) -> plc
     )
 
 
+def _shift(
+    column: Column, child: plc.Column, n: int, stream: Stream
+) -> tuple[plc.Column, plc.Column, plc.Column | None]:
+    """
+    Shift the elements ``child`` of every list of ``column`` by ``n`` positions.
+
+    ``child`` has one value per element of the sliced child of ``column``.
+    Return the offsets of the lists starting at 0, ``child`` shifted across
+    list boundaries, and a mask that is false where the shifted value comes
+    from another list (``None`` if ``n`` is 0).
+
+    ``column`` and ``child`` must be valid on ``stream``; synchronizes
+    ``stream``.
+    """
+    n = max(-child.size(), min(n, child.size()))
+    sizes = plc.lists.count_elements(column.obj.with_mask(None, 0), stream=stream)
+    if n >= 0:
+        starts = plc.Column.from_scalar(
+            plc.Scalar.from_py(0, plc.types.SIZE_TYPE, stream=stream),
+            column.size,
+            stream=stream,
+        )
+        steps = None
+    else:
+        starts = plc.binaryop.binary_operation(
+            sizes,
+            plc.Scalar.from_py(1, plc.types.SIZE_TYPE, stream=stream),
+            plc.binaryop.BinaryOperator.SUB,
+            plc.types.SIZE_TYPE,
+            stream=stream,
+        )
+        steps = plc.Column.from_scalar(
+            plc.Scalar.from_py(-1, plc.types.SIZE_TYPE, stream=stream),
+            column.size,
+            stream=stream,
+        )
+    positions = plc.lists.sequences(starts, sizes, steps, stream=stream).list_view()
+    shifted = plc.copying.shift(
+        child, n, plc.Scalar.from_py(None, child.type(), stream=stream), stream=stream
+    )
+    if n == 0:
+        return positions.offsets(), shifted, None
+    keep = plc.binaryop.binary_operation(
+        positions.child(),
+        plc.Scalar.from_py(abs(n), plc.types.SIZE_TYPE, stream=stream),
+        plc.binaryop.BinaryOperator.GREATER_EQUAL,
+        plc.DataType(plc.TypeId.BOOL8),
+        stream=stream,
+    )
+    return positions.offsets(), shifted, keep
+
+
 def _diff(
     column: Column,
     n: int,
@@ -99,53 +154,17 @@ def _diff(
     dtype: plc.DataType,
     stream: Stream,
 ) -> plc.Column:
-    """Subtract from every list element the element ``n`` positions before it."""
-    size_max = 2**31 - 1
-    n = max(-size_max, min(n, size_max))
-    int32 = plc.DataType(plc.TypeId.INT32)
-    sizes = plc.lists.count_elements(column.obj.with_mask(None, 0), stream=stream)
-    if n >= 0:
-        starts = plc.Column.from_scalar(
-            plc.Scalar.from_py(0, int32, stream=stream), column.size, stream=stream
-        )
-        steps = None
-    else:
-        starts = plc.binaryop.binary_operation(
-            sizes,
-            plc.Scalar.from_py(1, int32, stream=stream),
-            plc.binaryop.BinaryOperator.SUB,
-            int32,
-            stream=stream,
-        )
-        steps = plc.Column.from_scalar(
-            plc.Scalar.from_py(-1, int32, stream=stream), column.size, stream=stream
-        )
-    positions = plc.lists.sequences(starts, sizes, steps, stream=stream)
+    """
+    Subtract from every list element the element ``n`` positions before it.
+
+    ``column`` must be valid on ``stream``; synchronizes ``stream``.
+    """
     child = _diff_operand(
         column.obj.list_view().get_sliced_child(stream=stream), dtype, stream
     )
+    offsets, shifted, keep = _shift(column, child, n, stream)
     diff = plc.binaryop.binary_operation(
-        child,
-        plc.copying.shift(
-            child,
-            n,
-            plc.Scalar.from_py(None, child.type(), stream=stream),
-            stream=stream,
-        ),
-        plc.binaryop.BinaryOperator.SUB,
-        dtype,
-        stream=stream,
-    )
-    keep = (
-        plc.binaryop.binary_operation(
-            positions.list_view().child(),
-            plc.Scalar.from_py(abs(n), int32, stream=stream),
-            plc.binaryop.BinaryOperator.GREATER_EQUAL,
-            plc.DataType(plc.TypeId.BOOL8),
-            stream=stream,
-        )
-        if n != 0
-        else None
+        child, shifted, plc.binaryop.BinaryOperator.SUB, dtype, stream=stream
     )
     if keep is not None and null_behavior is NullBehavior.IGNORE:
         diff = plc.copying.copy_if_else(
@@ -153,13 +172,13 @@ def _diff(
         )
     result = with_mask_from(
         plc.Column(
-            positions.type(),
-            positions.size(),
+            plc.DataType(plc.TypeId.LIST),
+            column.size,
             None,
             None,
             0,
             0,
-            [positions.list_view().offsets(), diff],
+            [offsets, diff],
         ),
         column,
         stream,

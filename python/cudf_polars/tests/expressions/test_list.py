@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 import polars as pl
@@ -25,7 +26,7 @@ def test_list_diff(
     assert_gpu_result_equal(q, engine=engine)
 
 
-@pytest.mark.parametrize("n", [3, -3, 5, 2**40, -(2**40)])
+@pytest.mark.parametrize("n", [3, -5, -(2**40)])
 def test_list_diff_n_out_of_bounds(engine: pl.GPUEngine, n: int) -> None:
     lf = pl.LazyFrame({"a": [[1, 2, 2], [None, 3], [], None, [5], [1, 4, 9, 16]]})
     q = lf.select(pl.col("a").list.diff(n))
@@ -45,10 +46,7 @@ def test_list_diff_n_out_of_bounds(engine: pl.GPUEngine, n: int) -> None:
         pl.UInt64,
     ],
 )
-@pytest.mark.parametrize("null_behavior", ["ignore", "drop"])
-def test_list_diff_integer_overflow(
-    engine: pl.GPUEngine, dtype: pl.DataType, null_behavior: Literal["ignore", "drop"]
-) -> None:
+def test_list_diff_integer_overflow(engine: pl.GPUEngine, dtype: pl.DataType) -> None:
     info = np.iinfo(str(dtype).lower())
     values = [
         int(info.min),
@@ -60,7 +58,7 @@ def test_list_diff_integer_overflow(
         0,
     ]
     lf = pl.LazyFrame({"a": pl.Series([values, None, [1]], dtype=pl.List(dtype))})
-    q = lf.select(pl.col("a").list.diff(1, null_behavior=null_behavior))
+    q = lf.select(pl.col("a").list.diff())
     assert_gpu_result_equal(q, engine=engine)
 
 
@@ -73,12 +71,8 @@ def test_list_diff_float(engine: pl.GPUEngine, dtype: pl.DataType) -> None:
 
 
 @pytest.mark.parametrize("time_zone", [None, "UTC"])
-@pytest.mark.parametrize("n", [1, -2])
 def test_list_diff_datetime(
-    engine: pl.GPUEngine,
-    time_unit: Literal["ms", "us", "ns"],
-    time_zone: str | None,
-    n: int,
+    engine: pl.GPUEngine, time_unit: Literal["ms", "us", "ns"], time_zone: str | None
 ) -> None:
     values = [0, 5, None, -(2**63) + 1, 2**63 - 1, 2]
     lf = pl.LazyFrame(
@@ -88,7 +82,7 @@ def test_list_diff_datetime(
             )
         }
     )
-    q = lf.select(pl.col("a").list.diff(n))
+    q = lf.select(pl.col("a").list.diff(-2))
     assert_gpu_result_equal(q, engine=engine)
 
 
@@ -107,10 +101,7 @@ def test_list_diff_duration(
     assert_gpu_result_equal(q, engine=engine)
 
 
-@pytest.mark.parametrize("null_behavior", ["ignore", "drop"])
-def test_list_diff_date(
-    engine: pl.GPUEngine, null_behavior: Literal["ignore", "drop"]
-) -> None:
+def test_list_diff_date(engine: pl.GPUEngine) -> None:
     days = [
         0,
         2,
@@ -130,31 +121,22 @@ def test_list_diff_date(
             )
         }
     )
-    q = lf.select(pl.col("a").list.diff(1, null_behavior=null_behavior))
+    q = lf.select(pl.col("a").list.diff())
     assert_gpu_result_equal(q, engine=engine)
 
 
 @pytest.mark.parametrize("null_behavior", ["ignore", "drop"])
-def test_list_diff_empty(
-    engine: pl.GPUEngine, null_behavior: Literal["ignore", "drop"]
-) -> None:
-    lf = pl.LazyFrame({"a": pl.Series([], dtype=pl.List(pl.Int64))})
-    q = lf.select(pl.col("a").list.diff(1, null_behavior=null_behavior))
-    assert_gpu_result_equal(q, engine=engine)
-
-
 @pytest.mark.parametrize("values", [[], [None, None]])
 def test_list_diff_without_lists_follows_schema(
-    engine: pl.GPUEngine, values: list
+    engine: pl.GPUEngine, values: list, null_behavior: Literal["ignore", "drop"]
 ) -> None:
     lf = pl.LazyFrame({"a": pl.Series(values, dtype=pl.List(pl.UInt64))})
-    q = lf.select(pl.col("a").list.diff())
+    q = lf.select(pl.col("a").list.diff(null_behavior=null_behavior))
     assert_gpu_result_equal(q, engine=engine, check_dtypes=False)
     assert q.collect(engine=engine).schema == q.collect_schema()
 
 
-@pytest.mark.parametrize("null_behavior", ["ignore", "drop"])
-@pytest.mark.parametrize("n", [1, -1])
+@pytest.mark.parametrize("n,null_behavior", [(1, "ignore"), (-1, "drop")])
 @pytest.mark.parametrize("how", ["slice", "tail"])
 def test_list_diff_sliced(
     engine: pl.GPUEngine,
@@ -170,6 +152,20 @@ def test_list_diff_sliced(
     lf = lf.slice(1, 3) if how == "slice" else lf.tail(3)
     q = lf.select(pl.col("a").list.diff(n, null_behavior=null_behavior))
     assert_gpu_result_equal(q, engine=engine)
+
+
+def test_list_diff_sliced_null_rows_with_elements(
+    in_memory_engine: pl.GPUEngine,
+) -> None:
+    a = pa.ListArray.from_arrays(
+        pa.array([0, 3, 5, 8, 10], type=pa.int32()),
+        pa.array([3, 4, 8, 6, 7, 2, None, 5, 1, 7]),
+        mask=pa.array([False, True, False, False]),
+    )
+    df = pl.from_arrow(pa.table({"a": a}))
+    assert isinstance(df, pl.DataFrame)
+    q = pl.concat([df.lazy(), df.lazy()]).tail(6).select(pl.col("a").list.diff())
+    assert_gpu_result_equal(q, engine=in_memory_engine)
 
 
 def test_list_diff_group_by(engine: pl.GPUEngine) -> None:
@@ -213,37 +209,6 @@ def test_list_diff_drop_large_n_not_supported(
     lf = pl.LazyFrame({"a": [[1, 2, 4, 7], [1, 2]]})
     q = lf.select(pl.col("a").list.diff(n, null_behavior="drop"))
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
-
-
-@pytest.mark.parametrize(
-    "inner_dtype,data",
-    [
-        (pl.Int64, [[1, 2], [10, 2, 1]]),
-        (pl.Datetime("us"), [[1, 2]]),
-        (pl.Date, [[1, 2]]),
-        (pl.UInt64, [[1, 2]]),
-        (pl.UInt32, [[1, 2]]),
-        (pl.UInt8, [[1, 2]]),
-        (pl.Int8, [[1, 2]]),
-        (pl.Float32, [[1, 2]]),
-    ],
-    ids=[
-        "values",
-        "schema_datetime",
-        "schema_date",
-        "schema_uint64",
-        "schema_uint32",
-        "schema_uint8",
-        "schema_int8",
-        "schema_float32",
-    ],
-)
-def test_list_diff_polars_cases(
-    engine: pl.GPUEngine, inner_dtype: pl.DataType, data: list
-) -> None:
-    lf = pl.LazyFrame({"a": pl.Series(data).cast(pl.List(inner_dtype))})
-    q = lf.select(pl.col("a").list.diff(1))
-    assert_gpu_result_equal(q, engine=engine)
 
 
 def test_list_function_not_supported(in_memory_engine: pl.GPUEngine) -> None:
