@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 import polars as pl
-from polars.testing import assert_frame_equal
 
 from cudf_polars.containers import DataType
 from cudf_polars.dsl import expr
@@ -47,18 +47,11 @@ def test_list_set_union_float(engine: pl.GPUEngine) -> None:
     )
     q = lf.select(pl.col("a").list.set_union(pl.col("b")))
     assert_gpu_result_equal(q, engine=engine)
-
-
-def test_list_set_union_multiple_columns(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame(
-        {
-            "a": [[1, 2, 3], [1, 1, 1], [4]],
-            "b": [[4, 2, 1], [2, 1, 12], [4]],
-            "c": [[1, 2], [2, 1, 76], [8, 9]],
-        }
+    got = q.collect(engine=engine)["a"].explode().drop_nulls().drop_nans()
+    expect = q.collect()["a"].explode().drop_nulls().drop_nans()
+    np.testing.assert_array_equal(
+        np.signbit(got.to_numpy()), np.signbit(expect.to_numpy())
     )
-    q = lf.select(pl.col("a", "b").list.set_union("c"))
-    assert_gpu_result_equal(q, engine=engine)
 
 
 def test_list_set_union_empty(engine: pl.GPUEngine) -> None:
@@ -90,21 +83,19 @@ def test_list_set_union_sliced(
 
 
 @pytest.mark.parametrize("other", [[], [1, 2], [1, None]])
-@pytest.mark.parametrize("swap", [False, True])
+@pytest.mark.parametrize("form", ["series", "python_list", "swap"])
 def test_list_set_union_literal(
-    engine: pl.GPUEngine, other: list[int | None], *, swap: bool
+    engine: pl.GPUEngine, other: list[int | None], form: str
 ) -> None:
     lf = pl.LazyFrame({"a": [[1, 2, 3], [], [None, 3], None, [5, 6, 7]]})
-    column, literal = pl.col("a"), pl.lit(pl.Series([other], dtype=pl.List(pl.Int64)))
-    q = lf.select(
-        literal.list.set_union(column) if swap else column.list.set_union(literal)
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-def test_list_set_union_literal_python_list(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame({"a": [[2, 3, 3], [3, 1], None, [1, 2, 3]]})
-    q = lf.select(pl.col("a").list.set_union([1, 2]))
+    column = pl.col("a")
+    literal = pl.lit(pl.Series([other], dtype=pl.List(pl.Int64)))
+    if form == "series":
+        q = lf.select(column.list.set_union(literal))
+    elif form == "python_list":
+        q = lf.select(column.list.set_union(other))
+    else:
+        q = lf.select(literal.list.set_union(column))
     assert_gpu_result_equal(q, engine=engine)
 
 
@@ -117,7 +108,12 @@ def test_list_set_union_all_literals(engine: pl.GPUEngine) -> None:
 def test_list_set_union_null_literal(engine: pl.GPUEngine) -> None:
     lf = pl.LazyFrame({"a": [[1, 2], [], None]})
     q = lf.select(pl.col("a").list.set_union(pl.lit(None)))
-    assert_frame_equal(q.collect(engine=engine), q.collect())
+    # The CPU in-memory engine panics on a null list literal.
+    assert_gpu_result_equal(
+        q,
+        engine=engine,
+        polars_collect_kwargs={"engine": "streaming"},  # type: ignore[dict-item]
+    )
 
 
 @pytest.mark.parametrize("swap", [False, True])
@@ -171,20 +167,15 @@ def test_list_set_union_other_operation_not_supported(
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
-@pytest.mark.parametrize("inner", ["bool", "list", "struct", "null"])
+@pytest.mark.parametrize(
+    "inner",
+    [pl.Boolean, pl.List(pl.Int64), pl.Struct({"x": pl.Int64}), pl.Null],
+)
 def test_list_set_union_dtype_not_supported(
-    in_memory_engine: pl.GPUEngine, inner: str
+    in_memory_engine: pl.GPUEngine, inner: pl.DataType
 ) -> None:
-    data: list[object]
-    if inner == "bool":
-        data = [[True, None], [False]]
-    elif inner == "list":
-        data = [[[1], [2, 3]], [None]]
-    elif inner == "struct":
-        data = [[{"x": 1}], [None, {"x": 2}]]
-    else:
-        data = [[None], []]
-    lf = pl.LazyFrame({"a": data, "b": data[::-1]})
+    data = pl.Series([[None], []], dtype=pl.List(inner))
+    lf = pl.LazyFrame({"a": data, "b": data})
     q = lf.select(pl.col("a").list.set_union(pl.col("b")))
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 

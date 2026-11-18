@@ -39,18 +39,25 @@ class SetOperation(Enum):
 
 
 def _sequence(size: int, stream: Stream) -> plc.Column:
-    """Return the INT32 column ``0, 1, ..., size - 1``."""
-    size_type = plc.DataType(plc.TypeId.INT32)
+    """
+    Return the ``SIZE_TYPE`` column ``0, 1, ..., size - 1``.
+
+    Runs on ``stream`` and does not synchronize it.
+    """
     return plc.filling.sequence(
         size,
-        plc.Scalar.from_py(0, size_type, stream=stream),
-        plc.Scalar.from_py(1, size_type, stream=stream),
+        plc.Scalar.from_py(0, plc.types.SIZE_TYPE, stream=stream),
+        plc.Scalar.from_py(1, plc.types.SIZE_TYPE, stream=stream),
         stream=stream,
     )
 
 
 def _row_ids(col: plc.Column, stream: Stream) -> plc.Column:
-    """Return the row index of every element of the sliced child of list ``col``."""
+    """
+    Return the row index of every element of the sliced child of list ``col``.
+
+    ``col`` must be valid on ``stream``; synchronizes ``stream``.
+    """
     sizes = plc.lists.count_elements(col.with_mask(None, 0), stream=stream)
     (row_ids,) = plc.filling.repeat(
         plc.Table([_sequence(col.size(), stream)]), sizes, stream=stream
@@ -59,36 +66,40 @@ def _row_ids(col: plc.Column, stream: Stream) -> plc.Column:
 
 
 def _exploded(col: plc.Column, stream: Stream) -> plc.Table:
-    """Return the ``(row_id, value)`` table of the elements of list ``col``."""
+    """
+    Return the ``(row_id, value)`` table of the elements of list ``col``.
+
+    ``col`` must be valid on ``stream``; synchronizes ``stream``.
+    """
     return plc.Table(
         [_row_ids(col, stream), col.list_view().get_sliced_child(stream=stream)]
     )
 
 
 def _distinct_elements(exploded: plc.Table, stream: Stream) -> plc.Table:
-    """Return the first appearance of every distinct row of ``exploded``, in order."""
-    indices = plc.stream_compaction.distinct_indices(
+    """
+    Return the first appearance of every distinct row of ``exploded``, in order.
+
+    ``exploded`` must be valid on ``stream``; synchronizes ``stream``.
+    """
+    return plc.stream_compaction.stable_distinct(
         exploded,
+        [0, 1],
         plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,
         plc.types.NullEquality.EQUAL,
         plc.types.NanEquality.ALL_EQUAL,
         stream=stream,
-    )
-    (indices,) = plc.sorting.sort(
-        plc.Table([indices]),
-        [plc.types.Order.ASCENDING],
-        [plc.types.NullOrder.AFTER],
-        stream=stream,
-    ).columns()
-    return plc.copying.gather(
-        exploded, indices, plc.copying.OutOfBoundsPolicy.DONT_CHECK, stream=stream
     )
 
 
 def _offsets_from_sorted_row_ids(
     row_ids: plc.Column, n: int, stream: Stream
 ) -> plc.Column:
-    """Return the offsets of ``n`` lists whose elements have the sorted ``row_ids``."""
+    """
+    Return the offsets of ``n`` lists whose elements have the sorted ``row_ids``.
+
+    ``row_ids`` must be valid on ``stream``; does not synchronize ``stream``.
+    """
     return plc.search.lower_bound(
         plc.Table([row_ids]),
         plc.Table([_sequence(n + 1, stream)]),
@@ -104,7 +115,11 @@ def _rebuild_list(
     parent_mask: Span | None,
     null_count: int,
 ) -> plc.Column:
-    """Build a list column from ``offsets``, ``child`` and an unsliced null mask."""
+    """
+    Build a list column from ``offsets``, ``child`` and an unsliced null mask.
+
+    Launches no device work, so it takes no stream.
+    """
     return plc.Column(
         plc.DataType(plc.TypeId.LIST),
         offsets.size() - 1,
@@ -131,7 +146,11 @@ def _concat(columns: Sequence[plc.Column], stream: Stream) -> plc.Column:
 
 
 def _set_union(a: plc.Column, b: plc.Column, stream: Stream) -> plc.Column:
-    """Return the distinct elements of each row of ``a`` followed by ``b``, in order."""
+    """
+    Return the distinct elements of each row of ``a`` followed by ``b``, in order.
+
+    ``a`` and ``b`` must be valid on ``stream``; synchronizes ``stream``.
+    """
     concatenated = _concat([a, b], stream)
     row_ids, values = _distinct_elements(
         _exploded(concatenated, stream), stream
