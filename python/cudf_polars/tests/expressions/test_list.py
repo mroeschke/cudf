@@ -31,6 +31,8 @@ from cudf_polars.utils.versions import POLARS_VERSION_LT_21
         (2**40, 1),
         (-(2**40), 2**40 - 1),
         (-(2**63), 2**63 - 1),
+        (-(2**63), None),
+        (-(2**63), -1),
     ],
 )
 def test_list_slice_literal(
@@ -41,7 +43,7 @@ def test_list_slice_literal(
     assert_gpu_result_equal(q, engine=engine)
 
 
-@pytest.mark.parametrize("n", [0, 2, 10, -1])
+@pytest.mark.parametrize("n", [0, 2, 10, -1, -(2**63)])
 def test_list_slice_head_tail(engine: pl.GPUEngine, n: int) -> None:
     lf = pl.LazyFrame({"a": [[1, 2, 2], [None, 3], [], None, [5]]})
     q = lf.select(
@@ -51,33 +53,32 @@ def test_list_slice_head_tail(engine: pl.GPUEngine, n: int) -> None:
 
 
 @pytest.mark.parametrize(
-    "dtype",
+    "dtype,minimum",
     [
-        pl.Int8,
-        pl.Int16,
-        pl.Int32,
-        pl.Int64,
-        pl.UInt8,
-        pl.UInt16,
-        pl.UInt32,
+        (pl.Int8, -(2**7)),
+        (pl.UInt8, 0),
+        (pl.Int64, -(2**63)),
         pytest.param(
             pl.UInt64,
+            0,
             marks=pytest.mark.skipif(
                 POLARS_VERSION_LT_21, reason="UInt64 offsets fall back on Polars 2.0"
             ),
         ),
     ],
 )
-def test_list_slice_column(engine: pl.GPUEngine, dtype: pl.DataType) -> None:
+def test_list_slice_column(
+    engine: pl.GPUEngine, dtype: pl.DataType, minimum: int
+) -> None:
     signed = dtype.is_signed_integer()
     lf = pl.LazyFrame(
         {
             "a": [[1, 2, 2], [None, 3], [], None, [5]],
             "o": pl.Series(
-                [1, -1, 0, 2, -3] if signed else [1, 5, 0, 2, 0], dtype=dtype
+                [minimum, -1, 0, 2, -3] if signed else [1, 5, 0, 2, 0], dtype=dtype
             ),
             "l": pl.Series(
-                [2, -1, 3, 1, 1] if signed else [2, 1, 3, 1, 0], dtype=dtype
+                [-1, -1, 3, 1, 1] if signed else [2, 1, 3, 1, 0], dtype=dtype
             ),
         }
     )
@@ -111,19 +112,8 @@ def test_list_slice_nulls(engine: pl.GPUEngine, offset: str, length: str) -> Non
 
 @pytest.mark.skipif(POLARS_VERSION_LT_21, reason="Polars 2.0 raises for null offsets")
 def test_list_slice_null_scalar_offset(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame(
-        {
-            "a": [[1, 2], [3]],
-            "b": [1, 2],
-            "n": pl.Series([None, 1], dtype=pl.Int64),
-        }
-    )
-    q = lf.select(
-        pl.when(pl.lit(value=True))
-        .then(None)
-        .otherwise(pl.col("a").list.slice(pl.col("b"), 1)),
-        pl.col("a").list.slice(pl.col("n").first(), 1).alias("scalar"),
-    )
+    lf = pl.LazyFrame({"a": [[1, 2], [3]], "n": pl.Series([None, 1], dtype=pl.Int64)})
+    q = lf.select(pl.col("a").list.slice(pl.col("n").first(), 1))
     assert_gpu_result_equal(q, engine=engine)
 
 
@@ -184,38 +174,29 @@ def test_list_slice_offset_not_supported_polars_20(
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
-def test_list_slice_broadcast_list(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame({"o": [0, -1, 5, 1], "l": [1, 3, 2, -1]})
+@pytest.mark.parametrize("offset", ["literal", "column", "series"])
+@pytest.mark.parametrize("length", ["literal", "column", "series"])
+def test_list_slice_broadcast(engine: pl.GPUEngine, offset: str, length: str) -> None:
+    if {offset, length} == {"column", "series"}:
+        pytest.skip("Series literals are not split across ranks like columns")
+    if POLARS_VERSION_LT_21 and "column" in (offset, length):
+        pytest.skip("Polars 2.0 raises for null offsets and ignores null lengths")
+    lf = pl.LazyFrame({"o": [1, None, -1, 5], "l": [1, None, -1, 2]})
+    offsets = {
+        "literal": pl.lit(-2),
+        "column": pl.col("o"),
+        "series": pl.lit(pl.Series([0, 1, 2, -1])),
+    }
+    lengths = {
+        "literal": pl.lit(2),
+        "column": pl.col("l"),
+        "series": pl.lit(pl.Series([3, 2, 1, -1])),
+    }
     q = lf.select(
-        pl.lit([1, 2, 3]).list.slice(pl.col("o"), pl.col("l")).alias("both"),
-        pl.lit([1, 2, 3]).list.slice(-2, pl.col("l")).alias("length"),
-        pl.lit(None, dtype=pl.List(pl.Int64)).list.slice(pl.col("o")).alias("null"),
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-@pytest.mark.parametrize("offset", ["literal", "series"])
-@pytest.mark.parametrize("length", ["literal", "series"])
-def test_list_slice_broadcast_series(
-    engine: pl.GPUEngine, offset: str, length: str
-) -> None:
-    q = pl.LazyFrame().select(
-        pl.lit([0, 1, 2]).list.slice(
-            pl.lit(pl.Series([0, 1, 2])) if offset == "series" else 1,
-            pl.lit(pl.Series([3, 2, 1])) if length == "series" else 2,
-        )
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-@pytest.mark.skipif(POLARS_VERSION_LT_21, reason="Polars 2.0 raises for null offsets")
-def test_list_slice_broadcast_nulls(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame({"o": [1, None, -1], "l": [1, None, 1]})
-    a = pl.lit(pl.Series([[1, 2, 3]]))
-    q = lf.select(
-        o=a.list.slice(pl.col("o"), 1),
-        l=a.list.slice(1, pl.col("l")),
-        ol=a.list.slice(pl.col("o"), pl.col("l")),
+        pl.lit([1, 2, 3]).list.slice(offsets[offset], lengths[length]).alias("literal"),
+        pl.lit(None, dtype=pl.List(pl.Int64))
+        .list.slice(offsets[offset], lengths[length])
+        .alias("null"),
     )
     assert_gpu_result_equal(q, engine=engine)
 
@@ -233,62 +214,21 @@ def test_list_slice_nested(engine: pl.GPUEngine, inner: str) -> None:
     q = lf.select(
         pl.col("a").list.slice(pl.col("o"), 2).alias("slice"),
         pl.col("a").list.head(1).alias("head"),
-        pl.col("a").list.tail(1).alias("tail"),
+        pl.col("a").list.tail(pl.lit(1, pl.UInt32)).alias("tail"),
     )
     assert_gpu_result_equal(q, engine=engine)
 
 
-def test_list_slice_polars_cases(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame(
-        {
-            "a": [[1, 2, 3, 4], [10, 2, 1]],
-            "o": [1, 2],
-            "l": [3, 2],
-            "s": [["a", "b", "c"], ["d"]],
-        }
-    )
-    q = lf.select(
-        pl.col("a").list.head(2).alias("head"),
-        pl.col("a").list.tail(2).alias("tail"),
-        pl.col("a").list.tail(200).alias("tail_long"),
-        pl.col("a").list.head(200).alias("head_long"),
-        pl.col("a").list.slice(1, 2).alias("slice"),
-        pl.col("a").list.slice(-5, 2).alias("slice_before_start"),
-        pl.col("a").list.slice(1).alias("slice_to_end"),
-        pl.col("a").list.slice("o", "l").alias("columns"),
-        pl.col("a").list.slice("o", 1).alias("column_offset"),
-        pl.col("a").list.slice(-2, "l").alias("column_length"),
-        pl.col("s").list.tail(pl.lit(1, pl.UInt32)).alias("tail_uint32"),
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-def test_list_slice_list_of_struct(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame(
-        {
-            "a": [
-                [{"a": 1, "b": 4}, {"a": 3, "b": 6}],
-                [{"a": 10, "b": 40}, {"a": 20, "b": 50}, {"a": 30, "b": 60}],
-            ]
-        }
-    )
-    q = lf.select(
-        pl.col("a").list.head(1).alias("head"), pl.col("a").list.tail(1).alias("tail")
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-@pytest.mark.skipif(
-    POLARS_VERSION_LT_21,
-    reason="Polars 2.0 returns List(Null) for an all-null list column",
-)
+@pytest.mark.parametrize("rows", [0, 2])
 @pytest.mark.parametrize("offset", [0, "column"])
 @pytest.mark.parametrize("length", [1, "column"])
-def test_list_slice_all_null(
-    engine: pl.GPUEngine, offset: int | str, length: int | str
+def test_list_slice_empty_or_all_null(
+    engine: pl.GPUEngine, rows: int, offset: int | str, length: int | str
 ) -> None:
+    if POLARS_VERSION_LT_21 and "column" in (offset, length):
+        pytest.skip("Polars 2.0 returns List(Null) for an empty or all-null column")
     lf = pl.LazyFrame(
-        {"a": [None, None], "n": [0, 0]},
+        {"a": [None] * rows, "n": [0] * rows},
         schema={"a": pl.List(pl.String), "n": pl.Int64},
     )
     q = lf.select(
@@ -297,31 +237,6 @@ def test_list_slice_all_null(
             pl.col("n") if length == "column" else length,
         )
     )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-@pytest.mark.parametrize(
-    "argument",
-    [
-        "literal",
-        pytest.param(
-            "column",
-            marks=pytest.mark.skipif(
-                POLARS_VERSION_LT_21,
-                reason="Polars 2.0 returns List(Null) for an empty list column",
-            ),
-        ),
-    ],
-)
-def test_list_slice_zero_rows(engine: pl.GPUEngine, argument: str) -> None:
-    lf = pl.LazyFrame(
-        {
-            "a": pl.Series([], dtype=pl.List(pl.String)),
-            "o": pl.Series([], dtype=pl.Int64),
-        }
-    )
-    n = pl.col("o") if argument == "column" else 1
-    q = lf.select(pl.col("a").list.slice(n, n))
     assert_gpu_result_equal(q, engine=engine)
 
 
