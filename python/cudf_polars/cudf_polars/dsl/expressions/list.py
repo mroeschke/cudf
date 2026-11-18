@@ -7,6 +7,8 @@ from __future__ import annotations
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from polars.exceptions import SchemaError
+
 import pylibcudf as plc
 
 from cudf_polars.containers import Column
@@ -44,7 +46,9 @@ def _join(
         separator_narep = plc.Scalar.from_py(None, string, stream=stream)
         separator_value: plc.Column | plc.Scalar = separator
     else:
-        # For a scalar separator, pylibcudf passes separator_narep to libcudf as the narep of null strings: https://github.com/NVIDIA/cudf/blob/d3654d6f27e4fb30c0424a57cdbebfb1e73d3027/python/pylibcudf/pylibcudf/strings/combine.pyx#L265-L279
+        # With a Scalar separator, pylibcudf ignores string_narep and passes
+        # separator_narep to libcudf as the replacement for null elements:
+        # https://github.com/NVIDIA/cudf/blob/d3654d6f27e4fb30c0424a57cdbebfb1e73d3027/python/pylibcudf/pylibcudf/strings/combine.pyx#L265-L279
         separator_narep = narep
         separator_value = plc.Scalar.from_py(separator, string, stream=stream)
     return plc.strings.combine.join_list_elements(
@@ -122,8 +126,9 @@ class ListFunction(Expr):
         if self.name is ListFunction.Name.Join:
             _, separator = self.children
             if separator.dtype.id() != plc.TypeId.STRING:
-                raise NotImplementedError(
-                    f"ListFunction.{self.name.name} is not supported for a non-String separator"
+                raise SchemaError(
+                    "invalid series dtype: expected `String`, got "
+                    f"`{separator.dtype.polars_type._string_repr()}`"
                 )
 
     def do_evaluate(
@@ -134,26 +139,16 @@ class ListFunction(Expr):
             (ignore_nulls,) = self.options
             lists, separator = self.children
             column = lists.evaluate(df, context=context)
+            sep: plc.Column | str | None
             if isinstance(separator, Literal):
-                return Column(
-                    _join(
-                        column.obj,
-                        separator.value,
-                        ignore_nulls=ignore_nulls,
-                        stream=df.stream,
-                    ),
-                    dtype=self.dtype,
+                sep = separator.value
+            else:
+                column, separators = broadcast(
+                    column, separator.evaluate(df, context=context), stream=df.stream
                 )
-            column, separators = broadcast(
-                column, separator.evaluate(df, context=context), stream=df.stream
-            )
+                sep = separators.obj
             return Column(
-                _join(
-                    column.obj,
-                    separators.obj,
-                    ignore_nulls=ignore_nulls,
-                    stream=df.stream,
-                ),
+                _join(column.obj, sep, ignore_nulls=ignore_nulls, stream=df.stream),
                 dtype=self.dtype,
             )
         raise NotImplementedError(

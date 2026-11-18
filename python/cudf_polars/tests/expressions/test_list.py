@@ -17,7 +17,7 @@ def ignore_nulls(request: pytest.FixtureRequest) -> bool:
     return request.param
 
 
-@pytest.mark.parametrize("separator", ["literal", "column"])
+@pytest.mark.parametrize("separator", ["literal", "null", "column", "upper", "first"])
 def test_list_join(engine: pl.GPUEngine, separator: str, *, ignore_nulls: bool) -> None:
     lf = pl.LazyFrame(
         {
@@ -37,28 +37,14 @@ def test_list_join(engine: pl.GPUEngine, separator: str, *, ignore_nulls: bool) 
             "sep": ["&", None, "*", "_", "*", "-", "&", " ", "@", "/", ""],
         }
     )
-    sep = "-" if separator == "literal" else pl.col("sep")
+    sep = {
+        "literal": pl.lit("-"),
+        "null": pl.lit(None, dtype=pl.String),
+        "column": pl.col("sep"),
+        "upper": pl.col("sep").str.to_uppercase(),
+        "first": pl.col("sep").first(),
+    }[separator]
     q = lf.select(pl.col("a").list.join(sep, ignore_nulls=ignore_nulls))
-    assert_gpu_result_equal(q, engine=engine)
-
-
-def test_list_join_null_separator(engine: pl.GPUEngine, *, ignore_nulls: bool) -> None:
-    lf = pl.LazyFrame({"a": [["a", None, "b"], [], None]})
-    q = lf.select(
-        pl.col("a").list.join(pl.lit(None, dtype=pl.String), ignore_nulls=ignore_nulls)
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
-def test_list_join_separator_expression(
-    engine: pl.GPUEngine, *, ignore_nulls: bool
-) -> None:
-    lf = pl.LazyFrame({"a": [["a", None, "b"], [], None], "sep": ["-", None, "+"]})
-    q = lf.select(
-        pl.col("a").list.join(
-            pl.col("sep").str.to_uppercase(), ignore_nulls=ignore_nulls
-        )
-    )
     assert_gpu_result_equal(q, engine=engine)
 
 
@@ -111,16 +97,6 @@ def test_list_join_literal(engine: pl.GPUEngine, *, ignore_nulls: bool) -> None:
     assert_gpu_result_equal(q, engine=engine)
 
 
-def test_list_join_scalar_separator_expression(
-    engine: pl.GPUEngine, *, ignore_nulls: bool
-) -> None:
-    lf = pl.LazyFrame({"a": [["a", None, "b"], [], None], "sep": ["-", None, "+"]})
-    q = lf.select(
-        pl.col("a").list.join(pl.col("sep").last(), ignore_nulls=ignore_nulls)
-    )
-    assert_gpu_result_equal(q, engine=engine)
-
-
 def test_list_join_group_by(engine: pl.GPUEngine) -> None:
     lf = pl.LazyFrame(
         {
@@ -151,12 +127,14 @@ def test_list_join_implode_in_agg_not_supported(
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
-def test_list_join_non_string_separator_not_supported(
-    in_memory_engine: pl.GPUEngine,
+@pytest.mark.parametrize("separator", ["int", "null"])
+def test_list_join_non_string_separator_raises(
+    in_memory_engine: pl.GPUEngine, separator: str
 ) -> None:
     lf = pl.LazyFrame({"a": [["a", "b"]], "sep": [1]})
-    q = lf.select(pl.col("a").list.join(pl.col("sep")))
-    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+    sep = pl.col("sep") if separator == "int" else pl.lit(None)
+    q = lf.select(pl.col("a").list.join(sep))
+    assert_ir_translation_raises(q, in_memory_engine, pl.exceptions.SchemaError)
 
 
 def test_list_function_not_supported(in_memory_engine: pl.GPUEngine) -> None:
