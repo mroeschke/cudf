@@ -31,6 +31,7 @@ def assert_gather_out_of_bounds_raises(q: pl.LazyFrame, engine: pl.GPUEngine) ->
             q.collect(engine=engine)
 
 
+# CollectKwargs has no "engine" key, so polars_collect_kwargs can't select it
 def assert_gpu_result_equal_default_cpu_engine(
     q: pl.LazyFrame, engine: pl.GPUEngine
 ) -> None:
@@ -263,7 +264,7 @@ def test_list_gather_sliced(
         [6, None],
         [7, 5],
     ]
-    indices: list[list[int | None] | None] = [[0], [0, -1], [-1], [0], [1], [1, 0]]
+    indices: list[list[int | None] | None] = [[0], [0, -1], [-1], [0], [1], [5]]
     if with_nulls:
         lists[1] = None
         lists[3] = None

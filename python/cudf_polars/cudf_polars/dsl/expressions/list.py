@@ -30,8 +30,8 @@ __all__ = ["ListFunction"]
 
 _SIZE_TYPE_MAX = 2**31 - 1
 _SIZE_TYPE = plc.DataType(plc.TypeId.INT32)
-_CLAMPED_INDEX_TYPE_IDS = frozenset(
-    {plc.TypeId.INT32, plc.TypeId.INT64, plc.TypeId.UINT32, plc.TypeId.UINT64}
+_WIDE_INDEX_TYPE_IDS = frozenset(
+    {plc.TypeId.INT64, plc.TypeId.UINT32, plc.TypeId.UINT64}
 )
 
 
@@ -52,13 +52,13 @@ def _gather_map(indices: Column, stream: Stream) -> plc.Column:
     """
     Convert the elements of a list of integer indices to ``size_type``.
 
-    Indices outside ``[-(2**31 - 1), 2**31 - 1]`` are clamped to that
-    range. They stay out of bounds, because a list has at most
+    Indices of wider types outside ``[-(2**31 - 1), 2**31 - 1]`` are
+    clamped to that range. They stay out of bounds, because a list has at most
     ``2**31 - 1`` elements.
     """
     child = indices.obj.list_view().child()
     plc_type = child.type()
-    if plc_type.id() in _CLAMPED_INDEX_TYPE_IDS:
+    if plc_type.id() in _WIDE_INDEX_TYPE_IDS:
         lo = 0 if plc.traits.is_unsigned(plc_type) else -_SIZE_TYPE_MAX
         child = plc.replace.clamp(
             child,
@@ -90,17 +90,10 @@ def _check_gather_in_bounds(
         lengths = lengths.with_mask(
             *plc.null_mask.bitmask_and([lengths, indices], stream=stream)
         )
-    offset = indices.offset()
-    upper, lower = plc.copying.slice(
-        indices.list_view().offsets(),
-        [offset + 1, offset + indices.size() + 1, offset, offset + indices.size()],
-        stream=stream,
-    )
-    sizes = plc.binaryop.binary_operation(
-        upper, lower, plc.binaryop.BinaryOperator.SUB, _SIZE_TYPE, stream=stream
-    )
     (element_lengths,) = plc.filling.repeat(
-        plc.Table([lengths]), sizes, stream=stream
+        plc.Table([lengths]),
+        plc.lists.count_elements(gather_map, stream=stream),
+        stream=stream,
     ).columns()
     Op = plc.expressions.Operation
     Ref = plc.expressions.ColumnReference

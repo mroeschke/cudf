@@ -1431,6 +1431,7 @@ def _translate_function(
             *(translator.translate_expr(n=n, schema=schema) for n in node.input),
         )
     elif isinstance(name, plrs._expr_nodes.ListFunction):
+        # TODO: Handle implode wrapped in other expressions in group_by or rolling
         if translator._expr_context in (
             ExecutionContext.GROUPBY,
             ExecutionContext.ROLLING,
