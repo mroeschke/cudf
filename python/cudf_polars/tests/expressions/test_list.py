@@ -258,6 +258,7 @@ def test_concat_list_scalar_sliced(
             "i": pl.Series([3, null_value, 2, 1], dtype=pl.Int32),
             "s": ["c", "b", None if with_nulls else "n", "a"],
             "a": [[30], [40], None if with_nulls else [6], [10]],
+            "st": [{"x": 3}, {"x": 2}, None if with_nulls else {"x": 6}, {"x": 1}],
         }
     ).sort("k")
     lf = lf.slice(1, 3) if how == "slice" else lf.tail(3)
@@ -265,6 +266,7 @@ def test_concat_list_scalar_sliced(
         pl.concat_list("i", "a"),
         pl.concat_list("s", "s").alias("s2"),
         pl.concat_list("i", pl.lit(9)).alias("i2"),
+        pl.concat_list("st", "st").alias("st2"),
     )
     assert_gpu_result_equal(q, engine=engine)
 
@@ -280,7 +282,14 @@ def test_concat_list_scalar_group_by(engine: pl.GPUEngine) -> None:
 
 
 @pytest.mark.parametrize(
-    "left,right", [("j", "f"), ("f", "lit"), ("b", "a"), ("j", "lit")]
+    "left,right",
+    [
+        ("j", "f"),
+        ("f", "float_lit"),
+        ("b", "a"),
+        ("j", "float_lit"),
+        ("i8", "int_lit"),
+    ],
 )
 def test_concat_list_scalar_different_dtypes_not_supported(
     in_memory_engine: pl.GPUEngine, left: str, right: str
@@ -291,9 +300,11 @@ def test_concat_list_scalar_different_dtypes_not_supported(
             "f": pl.Series([1.5, None], dtype=pl.Float32),
             "b": [True, None],
             "a": [[1], None],
+            "i8": pl.Series([1, None], dtype=pl.Int8),
         }
     )
-    other = pl.lit(2.5) if right == "lit" else pl.col(right)
+    literals = {"float_lit": pl.lit(2.5), "int_lit": pl.lit(1)}
+    other = literals.get(right, pl.col(right))
     q = lf.select(pl.concat_list(pl.col(left), other))
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 

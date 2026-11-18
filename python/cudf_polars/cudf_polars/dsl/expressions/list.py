@@ -63,10 +63,16 @@ def _is_exact_cast(source: DataType, target: DataType) -> bool:
     ) and is_order_preserving_cast(from_, to)
 
 
+def _is_supported_input(child: Expr, dtype: DataType) -> bool:
+    """Whether ``child`` can be an input of a concatenation to ``dtype``."""
+    if child.dtype.id() == plc.TypeId.LIST:
+        return child.dtype == dtype
+    (inner,) = dtype.children
+    return _is_null_literal(child) or _is_exact_cast(child.dtype, inner)
+
+
 def _as_list(column: Column, dtype: DataType, stream: Stream) -> plc.Column:
-    """Return ``column`` if it has ``dtype``, else ``column`` as one-element lists."""
-    if column.dtype == dtype:
-        return column.obj
+    """Return the rows of non-list ``column`` as one-element lists of ``dtype``."""
     (inner,) = dtype.children
     child = column.astype(inner, stream).obj
     size_type = plc.DataType(plc.TypeId.INT32)
@@ -140,17 +146,12 @@ class ListFunction(Expr):
         self.is_pointwise = True
         if self.name not in self._valid_ops:
             raise NotImplementedError(f"ListFunction.{self.name.name} is not supported")
-        if self.name is ListFunction.Name.Concat:
-            (inner,) = self.dtype.children
-            if any(
-                child.dtype != self.dtype
-                if child.dtype.id() == plc.TypeId.LIST
-                else not (_is_null_literal(child) or _is_exact_cast(child.dtype, inner))
-                for child in self.children
-            ):
-                raise NotImplementedError(
-                    f"ListFunction.{self.name.name} is not supported for inputs of different dtypes"
-                )
+        if self.name is ListFunction.Name.Concat and not all(
+            _is_supported_input(child, self.dtype) for child in self.children
+        ):
+            raise NotImplementedError(
+                f"ListFunction.{self.name.name} is not supported for inputs of different dtypes"
+            )
 
     def do_evaluate(
         self, df: DataFrame, *, context: ExecutionContext = ExecutionContext.FRAME
@@ -169,7 +170,12 @@ class ListFunction(Expr):
             )
             return Column(
                 _concat(
-                    [_as_list(column, self.dtype, df.stream) for column in columns],
+                    [
+                        column.obj
+                        if child.dtype.id() == plc.TypeId.LIST
+                        else _as_list(column, self.dtype, df.stream)
+                        for child, column in zip(self.children, columns, strict=True)
+                    ],
                     df.stream,
                 ),
                 dtype=self.dtype,
