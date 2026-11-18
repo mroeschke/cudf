@@ -732,6 +732,21 @@ def test_groupby_top_level_implode(engine: pl.GPUEngine, df, expr):
     assert_gpu_result_equal(q, engine=engine)
 
 
+def test_groupby_top_level_implode_list_column(engine: pl.GPUEngine):
+    lf = (
+        pl.LazyFrame({"k": [3, 2, 1, 0], "a": [[3, 4], None, [2], [1]]})
+        .sort("k")
+        .slice(1, 3)
+    )
+    q = lf.group_by("k", maintain_order=True).agg(pl.col("a").implode())
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_groupby_implode_unsupported_child_raises(in_memory_engine: pl.GPUEngine, df):
+    q = df.group_by("key1").agg(pl.col("int").implode().over("key2"))
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
 @pytest.mark.parametrize(
     "expr",
     [

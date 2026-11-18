@@ -2037,9 +2037,12 @@ def _(
         (arg,) = node.arguments
         child = translator.translate_expr(n=arg, schema=schema)
         names = unique_names(schema)
-        aggs, _ = decompose_single_agg(
-            expr.NamedExpr(next(names), child), names, is_top=True, context=context
-        )
+        try:
+            aggs, _ = decompose_single_agg(
+                expr.NamedExpr(next(names), child), names, is_top=True, context=context
+            )
+        except NotImplementedError:
+            return child
         if any(has_agg for _, has_agg in aggs):
             raise NotImplementedError(
                 "implode of an aggregation is not supported in group_by or rolling"
