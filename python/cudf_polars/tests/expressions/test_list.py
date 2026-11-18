@@ -310,6 +310,216 @@ def test_list_slice_implode_in_agg_not_supported(
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
+def test_list_head_default(engine: pl.GPUEngine) -> None:
+    lf = pl.LazyFrame({"a": [[1, 2, 3, 4, 5, 6, 7], [None, 3], [], None, [5]]})
+    q = lf.select(pl.col("a").list.head())
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "n,dtype",
+    [(0, pl.UInt32), (2, pl.UInt32), (10, pl.UInt32), (-1, pl.Int16), (-10, pl.Int16)],
+)
+def test_list_head_typed_literal(
+    engine: pl.GPUEngine, n: int, dtype: pl.DataType
+) -> None:
+    lf = pl.LazyFrame({"a": [[1, 2, 2], [None, 3], [], None, [5]]})
+    q = lf.select(pl.col("a").list.head(pl.lit(n, dtype)))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.skipif(
+    POLARS_VERSION_LT_21, reason="Polars 2.0 in-memory slices to null for null lengths"
+)
+@pytest.mark.parametrize("dtype", [pl.Int16, pl.Int64, pl.UInt32, pl.UInt64])
+def test_list_head_column(engine: pl.GPUEngine, dtype: pl.DataType) -> None:
+    lf = pl.LazyFrame(
+        {
+            "a": [[1, 2, 2], [None, 3], [], None, [5], [6, 7]],
+            "n": pl.Series(
+                [2, None, 1, 0, 5, -1 if dtype.is_signed_integer() else 0],
+                dtype=dtype,
+            ),
+        }
+    )
+    q = lf.select(pl.col("a").list.head(pl.col("n")))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.skipif(
+    POLARS_VERSION_LT_21, reason="Polars 2.0 in-memory slices to null for null lengths"
+)
+@pytest.mark.parametrize("inner", ["string", "list", "struct"])
+def test_list_head_nested_column(engine: pl.GPUEngine, inner: str) -> None:
+    data: list[object]
+    if inner == "string":
+        data = [["x", "y", None], None, [], ["z"]]
+    elif inner == "list":
+        data = [[[1], None, [2, 3]], None, [], [[4]]]
+    else:
+        data = [[{"x": 1}, None, {"x": 2}], None, [], [{"x": None}]]
+    lf = pl.LazyFrame({"a": data, "n": pl.Series([2, 1, None, 0], dtype=pl.UInt8)})
+    q = lf.select(pl.col("a").list.head(pl.col("n")))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("n", [2, "column"])
+def test_list_head_zero_rows(engine: pl.GPUEngine, n: int | str) -> None:
+    if POLARS_VERSION_LT_21 and n == "column":
+        pytest.skip("Polars 2.0 returns List(Null) for an empty or all-null column")
+    lf = pl.LazyFrame(schema={"a": pl.List(pl.Int64), "n": pl.UInt32})
+    q = lf.select(pl.col("a").list.head(pl.col("n") if n == "column" else n))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("window", ["slice", "tail"])
+def test_list_head_sliced(
+    engine: pl.GPUEngine, window: str, *, with_nulls: bool
+) -> None:
+    lf = pl.LazyFrame(
+        {
+            "k": [3, 2, 1, 0],
+            "a": [[3, 4], None if with_nulls else [5, 6], [2], [1]],
+            "n": pl.Series([1, None if with_nulls else 2, 3, 0], dtype=pl.Int32),
+        }
+    ).sort("k")
+    lf = lf.tail(3) if window == "tail" else lf.slice(1, 3)
+    q = lf.select(
+        pl.col("a").list.head(1).alias("literal"),
+        pl.col("a").list.head(pl.col("n")).alias("column"),
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_list_head_implode_over(engine: pl.GPUEngine) -> None:
+    lf = pl.LazyFrame({"type": ["water", "fire", "water", "earth"]})
+    q = lf.select(pl.col("type").implode().list.head(1).over("type"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("values", [[1, 2, 3], [[1], None, [2, 3]]])
+def test_list_head_implode_in_agg_not_supported(
+    in_memory_engine: pl.GPUEngine, values: list
+) -> None:
+    lf = pl.LazyFrame({"k": [1, 1, 2], "a": values})
+    q = lf.group_by("k").agg(pl.col("a").implode().list.head())
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+def test_list_tail_default(engine: pl.GPUEngine) -> None:
+    lf = pl.LazyFrame({"a": [[1, 2, 3, 4, 5, 6, 7], [None, 3], [], None, [5]]})
+    q = lf.select(pl.col("a").list.tail())
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "n,dtype",
+    [
+        (0, pl.UInt32),
+        (2, pl.UInt32),
+        (10, pl.UInt32),
+        (-1, pl.Int16),
+        (-10, pl.Int16),
+        pytest.param(
+            2**64 - 1,
+            pl.UInt64,
+            marks=pytest.mark.skipif(
+                POLARS_VERSION_LT_21, reason="Polars 2.0 raises for null offsets"
+            ),
+        ),
+    ],
+)
+def test_list_tail_typed_literal(
+    engine: pl.GPUEngine, n: int, dtype: pl.DataType
+) -> None:
+    lf = pl.LazyFrame({"a": [[1, 2, 2], [None, 3], [], None, [5]]})
+    q = lf.select(pl.col("a").list.tail(pl.lit(n, dtype)))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.skipif(POLARS_VERSION_LT_21, reason="Polars 2.0 raises for null offsets")
+@pytest.mark.parametrize(
+    "dtype,extreme",
+    [
+        (pl.Int16, -1),
+        (pl.Int64, -(2**63)),
+        (pl.UInt32, 2**32 - 1),
+        (pl.UInt64, 2**64 - 1),
+    ],
+)
+def test_list_tail_column(
+    engine: pl.GPUEngine, dtype: pl.DataType, extreme: int
+) -> None:
+    lf = pl.LazyFrame(
+        {
+            "a": [[1, 2, 2], [None, 3], [], None, [5], [6, 7]],
+            "n": pl.Series([2, None, 1, 0, 5, extreme], dtype=dtype),
+        }
+    )
+    q = lf.select(pl.col("a").list.tail(pl.col("n")))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.skipif(POLARS_VERSION_LT_21, reason="Polars 2.0 raises for null offsets")
+@pytest.mark.parametrize("inner", ["string", "list", "struct"])
+def test_list_tail_nested_column(engine: pl.GPUEngine, inner: str) -> None:
+    data: list[object]
+    if inner == "string":
+        data = [["x", "y", None], None, [], ["z"]]
+    elif inner == "list":
+        data = [[[1], None, [2, 3]], None, [], [[4]]]
+    else:
+        data = [[{"x": 1}, None, {"x": 2}], None, [], [{"x": None}]]
+    lf = pl.LazyFrame({"a": data, "n": pl.Series([2, 1, None, 0], dtype=pl.UInt8)})
+    q = lf.select(pl.col("a").list.tail(pl.col("n")))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("n", [2, "column"])
+def test_list_tail_zero_rows(engine: pl.GPUEngine, n: int | str) -> None:
+    if POLARS_VERSION_LT_21 and n == "column":
+        pytest.skip("Polars 2.0 returns List(Null) for an empty or all-null column")
+    lf = pl.LazyFrame(schema={"a": pl.List(pl.Int64), "n": pl.UInt32})
+    q = lf.select(pl.col("a").list.tail(pl.col("n") if n == "column" else n))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("window", ["slice", "tail"])
+def test_list_tail_sliced(
+    engine: pl.GPUEngine, window: str, *, with_nulls: bool
+) -> None:
+    if with_nulls and POLARS_VERSION_LT_21:
+        pytest.skip("Polars 2.0 raises for null offsets")
+    lf = pl.LazyFrame(
+        {
+            "k": [3, 2, 1, 0],
+            "a": [[3, 4], None if with_nulls else [5, 6], [2], [1]],
+            "n": pl.Series([1, None if with_nulls else 2, 3, 0], dtype=pl.Int32),
+        }
+    ).sort("k")
+    lf = lf.tail(3) if window == "tail" else lf.slice(1, 3)
+    q = lf.select(
+        pl.col("a").list.tail(1).alias("literal"),
+        pl.col("a").list.tail(pl.col("n")).alias("column"),
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_list_tail_implode_over(engine: pl.GPUEngine) -> None:
+    lf = pl.LazyFrame({"type": ["water", "fire", "water", "earth"]})
+    q = lf.select(pl.col("type").implode().list.tail(1).over("type"))
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("values", [[1, 2, 3], [[1], None, [2, 3]]])
+def test_list_tail_implode_in_agg_not_supported(
+    in_memory_engine: pl.GPUEngine, values: list
+) -> None:
+    lf = pl.LazyFrame({"k": [1, 1, 2], "a": values})
+    q = lf.group_by("k").agg(pl.col("a").implode().list.tail())
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
 def test_list_function_not_supported(in_memory_engine: pl.GPUEngine) -> None:
     lf = pl.LazyFrame({"a": [[1, 2], None]})
     q = lf.select(pl.col("a").list.sample(n=1, seed=0))
