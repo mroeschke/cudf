@@ -21,12 +21,6 @@ def test_list_drop_nulls(engine: pl.GPUEngine, inner: pl.DataType) -> None:
     assert_gpu_result_equal(q, engine=engine)
 
 
-def test_list_drop_nulls_keeps_nan(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame({"a": [[1.0, float("nan"), None], [None, float("nan")], None]})
-    q = lf.select(pl.col("a").list.drop_nulls())
-    assert_gpu_result_equal(q, engine=engine)
-
-
 @pytest.mark.parametrize("inner", ["list", "struct"])
 def test_list_drop_nulls_nested(engine: pl.GPUEngine, inner: str) -> None:
     data: list[object]
@@ -35,12 +29,6 @@ def test_list_drop_nulls_nested(engine: pl.GPUEngine, inner: str) -> None:
     else:
         data = [[{"x": 1}, None, {"x": None}], None, [], [None]]
     lf = pl.LazyFrame({"a": data})
-    q = lf.select(pl.col("a").list.drop_nulls())
-    assert_gpu_result_equal(q, engine=engine)
-
-
-def test_list_drop_nulls_no_null_elements(engine: pl.GPUEngine) -> None:
-    lf = pl.LazyFrame({"a": [[1, 2], [], None, [3]]})
     q = lf.select(pl.col("a").list.drop_nulls())
     assert_gpu_result_equal(q, engine=engine)
 
@@ -95,6 +83,17 @@ def test_list_drop_nulls_literal(engine: pl.GPUEngine) -> None:
         [None, ["value"]],
         [None, ["value", None]],
         [None, [None, "value", None]],
+        [[1.0, float("nan"), None], [None, float("nan")], None],
+        [[1, 2], [], None, [3]],
+    ],
+    ids=[
+        "eager_series",
+        "eager_frame",
+        "lazy_no_null_elements",
+        "lazy_trailing_null",
+        "lazy_surrounding_nulls",
+        "keeps_nan",
+        "no_null_elements",
     ],
 )
 def test_list_drop_nulls_polars_cases(engine: pl.GPUEngine, data: list) -> None:

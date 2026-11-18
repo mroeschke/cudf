@@ -25,7 +25,11 @@ __all__ = ["ListFunction"]
 
 
 def _bool_list_like(col: plc.Column, bool_child: plc.Column) -> plc.Column:
-    """Build a list-of-bool column with the offsets of ``col`` and no null mask."""
+    """
+    Build a list-of-bool column with the offsets of ``col`` and no null mask.
+
+    ``bool_child`` has one value per element of the full child of ``col``.
+    """
     return plc.Column(
         col.type(),
         col.size(),
