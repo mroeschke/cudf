@@ -14,7 +14,18 @@ from cudf_polars.testing.asserts import (
 
 @pytest.mark.parametrize("fields", [[""], ["p", "q"], ["p", "q", "r", "s"]])
 @pytest.mark.parametrize(
-    "inner", [pl.Int8, pl.Int64, pl.UInt64, pl.Float64, pl.Boolean, pl.String]
+    "inner",
+    [
+        pl.Int8,
+        pl.Int64,
+        pl.UInt64,
+        pl.Float64,
+        pl.Boolean,
+        pl.String,
+        pl.Decimal(10, 2),
+        pl.Datetime("us"),
+    ],
+    ids=str,
 )
 def test_list_to_struct(
     engine: pl.GPUEngine, inner: pl.DataType, fields: list[str]
@@ -23,17 +34,6 @@ def test_list_to_struct(
         {"a": pl.Series([[1, 2, 2], [None, 3], [], None, [5]]).cast(pl.List(inner))}
     )
     q = lf.select(pl.col("a").list.to_struct(fields))
-    assert_gpu_result_equal(q, engine=engine)
-
-
-@pytest.mark.parametrize("inner", [pl.Decimal(10, 2), pl.Datetime("us")])
-def test_list_to_struct_decimal_datetime(
-    engine: pl.GPUEngine, inner: pl.DataType
-) -> None:
-    lf = pl.LazyFrame(
-        {"a": pl.Series([[1, 2, 2], [None, 3], [], None, [5]], dtype=pl.List(inner))}
-    )
-    q = lf.select(pl.col("a").list.to_struct(["p", "q"]))
     assert_gpu_result_equal(q, engine=engine)
 
 
